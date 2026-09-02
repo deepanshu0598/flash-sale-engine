@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { PassportModule } from '@nestjs/passport';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import appConfig from './config/app.config.js';
@@ -11,6 +12,7 @@ import { AuthModule } from './modules/auth/auth.module.js';
 import { UserModule } from './modules/user/user.module.js';
 import { ProductModule } from './modules/product/product.module.js';
 import { FlashSaleModule } from './modules/flash-sale/flash-sale.module.js';
+import { OrderModule } from './modules/order/order.module.js';
 
 @Module({
   imports: [
@@ -31,11 +33,13 @@ import { FlashSaleModule } from './modules/flash-sale/flash-sale.module.js';
         synchronize: true,
       }),
     }),
+    PassportModule.register({ defaultStrategy: 'jwt' }),
     RedisModule,
     AuthModule,
     UserModule,
     ProductModule,
     FlashSaleModule,
+    OrderModule,
   ],
   controllers: [AppController],
   providers: [AppService],
