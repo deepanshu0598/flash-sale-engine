@@ -10,6 +10,7 @@ import { RedisModule } from './modules/redis/redis.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { UserModule } from './modules/user/user.module.js';
 import { ProductModule } from './modules/product/product.module.js';
+import { FlashSaleModule } from './modules/flash-sale/flash-sale.module.js';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { ProductModule } from './modules/product/product.module.js';
     AuthModule,
     UserModule,
     ProductModule,
+    FlashSaleModule,
   ],
   controllers: [AppController],
   providers: [AppService],
