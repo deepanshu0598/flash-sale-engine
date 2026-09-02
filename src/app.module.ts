@@ -9,6 +9,7 @@ import redisConfig from './config/redis.config.js';
 import { RedisModule } from './modules/redis/redis.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { UserModule } from './modules/user/user.module.js';
+import { ProductModule } from './modules/product/product.module.js';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { UserModule } from './modules/user/user.module.js';
     RedisModule,
     AuthModule,
     UserModule,
+    ProductModule,
   ],
   controllers: [AppController],
   providers: [AppService],
