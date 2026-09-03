@@ -13,6 +13,7 @@ import { UserModule } from './modules/user/user.module.js';
 import { ProductModule } from './modules/product/product.module.js';
 import { FlashSaleModule } from './modules/flash-sale/flash-sale.module.js';
 import { OrderModule } from './modules/order/order.module.js';
+import { QueueModule } from './modules/queue/queue.module.js';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { OrderModule } from './modules/order/order.module.js';
     }),
     PassportModule.register({ defaultStrategy: 'jwt' }),
     RedisModule,
+    QueueModule,
     AuthModule,
     UserModule,
     ProductModule,
