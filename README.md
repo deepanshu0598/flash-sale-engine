@@ -1,114 +1,200 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Flash Sale Engine
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+> Handles 1,000+ concurrent buyers for limited-stock items without overselling.
+> Built with NestJS, Redis, BullMQ, and PostgreSQL.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+[![CI](https://github.com/deepanshu0598/flash-sale-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/deepanshu0598/flash-sale-engine/actions/workflows/ci.yml)
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## The Problem
 
-## Project setup
+When thousands of users hit "Buy Now" at the same time for a product with `stock = 100`:
 
-```bash
-$ npm install
+```
+Without protection:
+  Worker A reads stock = 100 ✓
+  Worker B reads stock = 100 ✓      ← both read before either writes
+  Worker A writes stock = 99 ✓
+  Worker B writes stock = 99 ✗      ← should be 98. You just sold 101 units.
+
+With this engine:
+  Lua script runs atomically → check + decrement = one uninterruptible Redis operation
+  Distributed lock → only one worker enters the critical section per sale
+  Result: exactly 100 orders, never 101
 ```
 
-## Compile and run the project
+---
 
-```bash
-# development
-$ npm run start
+## Architecture
 
-# watch mode
-$ npm run start:dev
+```
+HTTP Clients (1000+ concurrent)
+         │
+  [NestJS API :3000]
+         │
+         ├──→ Step 0: Redis GET inventory:{saleId}   ← instant 409 if sold out (no lock)
+         │
+         ├──→ Step 1: Redis cache-aside sale lookup  ← avoids DB hit on every request
+         │
+         ├──→ Step 2: Redis SET NX EX (distributed lock)
+         │
+         ├──→ Step 3: PostgreSQL — per-user limit check (inside lock)
+         │
+         ├──→ Step 4: Redis Lua — atomic stock deduction
+         │              └── returns -1 → 409 Sold out
+         │              └── returns -2 → 500 Not initialized
+         │              └── returns N  → stock remaining
+         │
+         ├──→ Step 5: PostgreSQL — INSERT order (status: PENDING)
+         │
+         ├──→ Step 6: BullMQ — enqueue PROCESS_ORDER job
+         │
+         └──→ Step 7: Redis — release lock (always, in finally block)
 
-# production mode
-$ npm run start:prod
+[BullMQ Worker — same process]
+  ← picks up job
+  ← simulates payment (150ms)
+  ← PostgreSQL UPDATE order (status: CONFIRMED)
+  ← PostgreSQL INCREMENT flash_sales.soldCount
+
+[Bull Board  :3000/queues]  ← monitor jobs visually
+[Swagger     :3000/api]     ← interactive API docs
+[Health      :3000/health]  ← readiness probe
 ```
 
-## Run tests
+---
 
-```bash
-# unit tests
-$ npm run test
+## Key Engineering Decisions
 
-# e2e tests
-$ npm run test:e2e
+**1. Lua script over MULTI/EXEC for inventory deduction**
 
-# test coverage
-$ npm run test:cov
+Lua executes atomically inside Redis — the check-and-decrement is a single uninterruptible operation. MULTI/EXEC (optimistic locking) can fail under high contention and requires client-side retry logic. Lua always wins on the first attempt.
+
+**2. Distributed lock per sale, not per user**
+
+The lock serializes concurrent writes to the same sale. A per-user lock would allow two requests from the same user to both pass the limit check simultaneously (classic TOCTOU race). The per-user limit check lives *inside* the lock for this exact reason.
+
+**3. Redis as stock source of truth during sale window**
+
+All reads and writes during a flash sale hit Redis, not PostgreSQL. This keeps the DB free of 10K concurrent SELECT/UPDATE queries. The DB receives only confirmed orders via the BullMQ queue — decoupled from the hot path.
+
+**4. BullMQ for async order processing**
+
+The HTTP response returns in < 100ms with `orderId` + `jobId`. Payment processing, soldCount increment, and status updates happen asynchronously. Failed jobs retry up to 3 times with exponential backoff.
+
+**5. Step 0 fast pre-check**
+
+A plain Redis GET before lock acquisition rejects "definitely sold out" requests instantly (~0.1ms). This drops 95%+ of requests before they ever compete for the lock once stock is depleted.
+
+---
+
+## Load Test Results (k6)
+
+**Setup:** 1,000 virtual users, ramping 0 → 1000 → 0 over 50 seconds. Single Node.js process.
+
+```
+  ✓ error_rate          rate=0.00%        (no 5xx errors)
+  ✓ successful_purchases count=254        (lock correctly serialized purchases)
+  ✓ http_req_duration   p(95)=3.4s       (lock-wait bound under 1000 VUs)
+
+  sold_out_responses.......: 9,232   (fast Redis pre-check path — no lock acquired)
+  successful_purchases.....: 254
+  error_rate...............: 0.00%
+  http_req_failed..........: 97.31% (k6 counts 409 as failed — all expected 409s)
 ```
 
-## Deployment
+> `http_req_failed` counts 4xx — the 97% "failures" are all correct 409 Sold Out responses,
+> not errors. Zero 5xx means the system never crashed under load.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+---
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+## Quick Start
+
+**Prerequisites:** Docker, Node.js 20+
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+# 1. Start infrastructure
+docker-compose up -d
+
+# 2. Install dependencies
+npm install
+
+# 3. Run DB migrations
+npm run migration:run
+
+# 4. Seed 10K users + 50 products + 10 flash sales
+npm run seed
+
+# 5. Start the server
+npm run start:dev
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+**Test the purchase flow:**
+```bash
+# Login
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@flashsale.com","password":"password123"}' \
+  | jq -r '.access_token')
 
-## Observability
+# Get a sale ID
+SALE_ID=$(curl -s http://localhost:3000/flash-sales \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
+# Purchase
+curl -X POST http://localhost:3000/flash-sales/$SALE_ID/purchase \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"quantity": 1}'
+```
 
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
+---
 
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
+## Testing
 
-## Resources
+```bash
+# Unit tests (15 tests — all purchase() critical paths)
+npm test
 
-Check out a few resources that may come in handy when working with NestJS:
+# E2E tests (no-oversell proof: 20 concurrent requests, stock=5, succeeded <= 5)
+npm run test:e2e
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observer](https://observer.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+# Load test (requires k6)
+BASE_URL=http://localhost:3000 SALE_ID=<your-sale-id> k6 run test/load/flash-sale.k6.js
+```
 
-## Support
+---
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+## API Overview
 
-## Stay in touch
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/auth/register` | Register a new user |
+| POST | `/auth/login` | Login, returns JWT token |
+| GET | `/products` | List all products |
+| POST | `/products` | Create a product |
+| GET | `/flash-sales` | List sales with live Redis stock |
+| POST | `/flash-sales` | Create a flash sale |
+| POST | `/flash-sales/:id/purchase` | Purchase (the core endpoint) |
+| GET | `/orders/:id` | Track order status |
+| GET | `/health` | Health check |
+| GET | `/queues` | Bull Board job monitor |
+| GET | `/api` | Swagger UI |
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+---
 
-## License
+## Tech Stack
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+| Layer | Technology |
+|-------|-----------|
+| API Framework | NestJS 12 (ESM) |
+| Language | TypeScript |
+| Database | PostgreSQL 16 + TypeORM |
+| Cache / Lock | Redis 7 + ioredis |
+| Queue | BullMQ + @nestjs/bull |
+| Auth | JWT + Passport |
+| Testing | Vitest + supertest |
+| Load Testing | k6 |
+| CI | GitHub Actions |
+| Infrastructure | Docker Compose |
