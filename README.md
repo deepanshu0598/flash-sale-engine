@@ -1,6 +1,7 @@
 # Flash Sale Engine
 
 > Handles 1,000+ concurrent buyers for limited-stock items without overselling.
+> Architected to scale to 10,000+ concurrent with horizontal replicas + lock-free Lua.
 > Built with NestJS, Redis, BullMQ, and PostgreSQL.
 
 [![CI](https://github.com/deepanshu0598/flash-sale-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/deepanshu0598/flash-sale-engine/actions/workflows/ci.yml)
@@ -106,6 +107,98 @@ A plain Redis GET before lock acquisition rejects "definitely sold out" requests
 
 > `http_req_failed` counts 4xx — the 97% "failures" are all correct 409 Sold Out responses,
 > not errors. Zero 5xx means the system never crashed under load.
+
+---
+
+## Scaling to 10K+ Concurrent
+
+Current v1.0 architecture handles ~1,000 concurrent on a single Node.js process.
+The distributed lock (Step 2) is the primary bottleneck — it serializes all purchase requests per sale.
+
+### Bottleneck chain
+
+```
+10K users → Redis lock (SET NX EX)      ← only 1 request enters at a time
+                   │
+                   ▼
+            PostgreSQL COUNT             ← DB query inside serial lock
+                   │
+                   ▼
+            Lua deduction                ← atomic, not the problem
+```
+
+### Phase 1 — Quick wins (1 day)
+
+| Change | Impact |
+|--------|--------|
+| Lock TTL 5000ms → 300ms | Fail-fast instead of waiting 5s; frees VUs faster |
+| DB pool max 10 → 50 | Handles burst of concurrent INSERTs at stock exhaustion |
+
+### Phase 2 — Eliminate the lock (2-3 days)
+
+Move the per-user limit check from PostgreSQL (inside lock) into the Lua script itself.
+When both checks live in Redis, there is nothing left to lock.
+
+```lua
+-- Atomic: inventory check + user limit check + deduct — no distributed lock needed
+local stock  = tonumber(redis.call('GET', KEYS[1]))  -- inventory:{saleId}
+local bought = tonumber(redis.call('GET', KEYS[2]) or '0')  -- user_purchases:{userId}:{saleId}
+
+if stock < qty   then return -1 end  -- 409 Sold out
+if bought + qty > max_user then return -3 end  -- 400 User limit
+
+redis.call('DECRBY', KEYS[1], qty)
+redis.call('INCRBY', KEYS[2], qty)
+return stock - qty  -- remaining stock
+```
+
+New purchase flow — lock-free:
+
+```
+Step 0: Redis GET inventory          ← fast pre-check (same)
+Step 1: Redis cache-aside sale       ← same
+Step 2: Redis Lua (inventory +       ← replaces lock + DB count + old Lua
+        user limit + deduct)
+Step 3: PostgreSQL INSERT order      ← outside any lock, fully parallel-safe
+Step 4: BullMQ enqueue               ← same
+```
+
+Expected throughput: ~5,000 concurrent on a single instance (no serialization).
+
+### Phase 3 — Horizontal scaling (1-2 days)
+
+Run 4 Node.js replicas behind nginx. The Redis lock already works across instances (Phase 2
+removes it entirely). Redis remains the single source of truth — replicas share it naturally.
+
+```
+                 nginx (least_conn)
+                 /    |    \    \
+             app1  app2  app3  app4   ← 4 NestJS replicas
+                 \    |    /    /
+                  PostgreSQL + Redis  ← shared, unchanged
+```
+
+```yaml
+# docker-compose.yml — add replicas + nginx
+services:
+  app:
+    deploy:
+      replicas: 4
+  nginx:
+    image: nginx:alpine
+    ports: ['3000:80']
+```
+
+Expected throughput: 4 instances × 5K = **10K+ concurrent**.
+
+### Scaling Roadmap Summary
+
+| Phase | Change | Effort | Concurrent |
+|-------|--------|--------|-----------|
+| v1.0 (current) | Single instance + distributed lock | — | ~1K |
+| Phase 1 | Lock TTL + DB pool | 1 day | ~2K |
+| Phase 2 | Lock-free Lua (user limit in Redis) | 2-3 days | ~5K |
+| Phase 3 | 4 replicas + nginx | 1-2 days | **10K+** |
 
 ---
 
