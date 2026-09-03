@@ -17,7 +17,6 @@ const saleRepo = {
 };
 
 const orderRepo = {
-  count:  vi.fn(),
   create: vi.fn(),
   save:   vi.fn(),
   update: vi.fn(),
@@ -27,9 +26,7 @@ const redisService = {
   getInventory:     vi.fn(),
   getSaleFromCache: vi.fn(),
   setSaleCache:     vi.fn(),
-  acquireLock:      vi.fn(),
-  releaseLock:      vi.fn(),
-  deductInventory:  vi.fn(),
+  atomicPurchase:   vi.fn(),
 };
 
 const productService = { findOne: vi.fn() };
@@ -74,10 +71,7 @@ beforeEach(() => {
   redisService.getInventory.mockResolvedValue(50);
   redisService.getSaleFromCache.mockResolvedValue(mockSale);
   redisService.setSaleCache.mockResolvedValue(undefined);
-  redisService.acquireLock.mockResolvedValue(true);
-  redisService.releaseLock.mockResolvedValue(undefined);
-  redisService.deductInventory.mockResolvedValue(49);
-  orderRepo.count.mockResolvedValue(0);
+  redisService.atomicPurchase.mockResolvedValue(49);  // remaining stock after deduction
   orderRepo.create.mockReturnValue({ id: 'order-uuid', status: OrderStatus.PENDING });
   orderRepo.save.mockResolvedValue({ id: 'order-uuid' });
   orderRepo.update.mockResolvedValue(undefined);
@@ -90,13 +84,13 @@ describe('FlashSaleService.purchase()', () => {
 
   // ── Step 0: Quick pre-check ─────────────────────────────────────────────────
   describe('Step 0 — quick pre-check', () => {
-    it('throws 409 immediately when quickStock is 0 — no lock, no DB', async () => {
+    it('throws 409 immediately when quickStock is 0 — no Lua, no DB', async () => {
       redisService.getInventory.mockResolvedValue(0);
 
       await expect(service.purchase(userId, saleId, dto))
         .rejects.toThrow(ConflictException);
 
-      expect(redisService.acquireLock).not.toHaveBeenCalled();
+      expect(redisService.atomicPurchase).not.toHaveBeenCalled();
       expect(saleRepo.findOne).not.toHaveBeenCalled();
     });
   });
@@ -105,19 +99,17 @@ describe('FlashSaleService.purchase()', () => {
   describe('Step 1 — cache-aside sale lookup', () => {
     it('reads sale from Redis cache — does NOT hit DB', async () => {
       redisService.getSaleFromCache.mockResolvedValue(mockSale);
-      redisService.acquireLock.mockResolvedValue(false); // fail fast after cache hit
 
-      await expect(service.purchase(userId, saleId, dto)).rejects.toThrow();
+      await service.purchase(userId, saleId, dto);
 
       expect(saleRepo.findOne).not.toHaveBeenCalled();
     });
 
     it('falls back to DB on cache miss and caches the result', async () => {
-      redisService.getSaleFromCache.mockResolvedValue(null); // cache miss
+      redisService.getSaleFromCache.mockResolvedValue(null);
       saleRepo.findOne.mockResolvedValue(mockSale);
-      redisService.acquireLock.mockResolvedValue(false);
 
-      await expect(service.purchase(userId, saleId, dto)).rejects.toThrow();
+      await service.purchase(userId, saleId, dto);
 
       expect(saleRepo.findOne).toHaveBeenCalledTimes(1);
       expect(redisService.setSaleCache).toHaveBeenCalledWith(saleId, mockSale, 60);
@@ -142,68 +134,55 @@ describe('FlashSaleService.purchase()', () => {
     });
   });
 
-  // ── Step 2: Distributed lock ─────────────────────────────────────────────────
-  describe('Step 2 — distributed lock', () => {
-    it('throws ConflictException when lock is not acquired', async () => {
-      redisService.acquireLock.mockResolvedValue(false);
-
-      await expect(service.purchase(userId, saleId, dto))
-        .rejects.toThrow(ConflictException);
-    });
-  });
-
-  // ── Step 3: Per-user limit ───────────────────────────────────────────────────
-  describe('Step 3 — per-user limit (inside lock)', () => {
-    it('throws BadRequestException when user already hit maxPerUser limit', async () => {
-      redisService.getSaleFromCache.mockResolvedValue({ ...mockSale, maxPerUser: 1 });
-      orderRepo.count.mockResolvedValue(1); // already bought 1, maxPerUser = 1
-
-      await expect(service.purchase(userId, saleId, dto))
-        .rejects.toThrow(BadRequestException);
-    });
-  });
-
-  // ── Step 4: Lua inventory deduction ─────────────────────────────────────────
-  describe('Step 4 — Lua inventory deduction', () => {
+  // ── Step 2: Atomic Lua purchase ──────────────────────────────────────────────
+  describe('Step 2 — atomic Lua purchase (inventory + user limit + deduct)', () => {
     it('throws ConflictException when Lua returns -1 (sold out)', async () => {
-      redisService.deductInventory.mockResolvedValue(-1);
+      redisService.atomicPurchase.mockResolvedValue(-1);
 
       await expect(service.purchase(userId, saleId, dto))
         .rejects.toThrow(ConflictException);
     });
 
     it('throws InternalServerErrorException when Lua returns -2 (not initialized)', async () => {
-      redisService.deductInventory.mockResolvedValue(-2);
+      redisService.atomicPurchase.mockResolvedValue(-2);
 
       await expect(service.purchase(userId, saleId, dto))
         .rejects.toThrow(InternalServerErrorException);
     });
-  });
 
-  // ── Step 7: Lock always released (finally) ───────────────────────────────────
-  describe('Step 7 — lock always released in finally block', () => {
-    it('releases lock even when Lua returns sold out (-1)', async () => {
-      redisService.deductInventory.mockResolvedValue(-1);
+    it('throws BadRequestException when Lua returns -3 (user limit exceeded)', async () => {
+      redisService.atomicPurchase.mockResolvedValue(-3);
 
-      await expect(service.purchase(userId, saleId, dto)).rejects.toThrow();
-
-      expect(redisService.releaseLock).toHaveBeenCalledTimes(1);
+      await expect(service.purchase(userId, saleId, dto))
+        .rejects.toThrow(BadRequestException);
     });
 
-    it('releases lock even when DB save throws', async () => {
-      orderRepo.save.mockRejectedValue(new Error('DB connection lost'));
+    it('passes saleId, userId, quantity, maxPerUser to atomicPurchase', async () => {
+      await service.purchase(userId, saleId, dto);
 
-      await expect(service.purchase(userId, saleId, dto)).rejects.toThrow();
-
-      expect(redisService.releaseLock).toHaveBeenCalledTimes(1);
+      expect(redisService.atomicPurchase).toHaveBeenCalledWith(
+        saleId,
+        userId,
+        1,
+        mockSale.maxPerUser,
+        expect.any(Number),
+      );
     });
 
-    it('releases lock even when user limit is exceeded', async () => {
-      orderRepo.count.mockResolvedValue(99);
+    it('does NOT create a DB order when Lua rejects (sold out)', async () => {
+      redisService.atomicPurchase.mockResolvedValue(-1);
 
       await expect(service.purchase(userId, saleId, dto)).rejects.toThrow();
 
-      expect(redisService.releaseLock).toHaveBeenCalledTimes(1);
+      expect(orderRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('does NOT create a DB order when Lua rejects (user limit)', async () => {
+      redisService.atomicPurchase.mockResolvedValue(-3);
+
+      await expect(service.purchase(userId, saleId, dto)).rejects.toThrow();
+
+      expect(orderRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -213,13 +192,29 @@ describe('FlashSaleService.purchase()', () => {
       const result = await service.purchase(userId, saleId, dto);
 
       expect(result).toEqual({ orderId: 'order-uuid', jobId: 'job-1' });
-      expect(redisService.releaseLock).toHaveBeenCalledTimes(1);
     });
 
-    it('releases lock even on success', async () => {
+    it('creates a PENDING order in DB after successful Lua deduction', async () => {
       await service.purchase(userId, saleId, dto);
 
-      expect(redisService.releaseLock).toHaveBeenCalledTimes(1);
+      expect(orderRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId,
+          flashSaleId: saleId,
+          status: OrderStatus.PENDING,
+        }),
+      );
+      expect(orderRepo.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('enqueues a BullMQ job after DB order creation', async () => {
+      await service.purchase(userId, saleId, dto);
+
+      expect(orderQueue.add).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ orderId: 'order-uuid', userId, saleId }),
+        expect.any(Object),
+      );
     });
   });
 });

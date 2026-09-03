@@ -53,6 +53,15 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       lua: releaseScript,
     });
 
+    const atomicScript = readFileSync(
+      join(scriptsDir, 'purchase-atomic.lua'),
+      'utf8',
+    );
+    this.client.defineCommand('atomicPurchase', {
+      numberOfKeys: 3,
+      lua: atomicScript,
+    });
+
     this.logger.log('Lua scripts loaded');
   }
 
@@ -83,6 +92,23 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       `inventory:${saleId}`,
       `sold:${saleId}`,
       qty,
+    );
+  }
+
+  async atomicPurchase(
+    saleId: string,
+    userId: string,
+    qty: number,
+    maxPerUser: number,
+    ttlSeconds: number,
+  ): Promise<number> {
+    return (this.client as any).atomicPurchase(
+      `inventory:${saleId}`,
+      `sold:${saleId}`,
+      `user_purchases:${userId}:${saleId}`,
+      qty,
+      maxPerUser,
+      ttlSeconds,
     );
   }
 

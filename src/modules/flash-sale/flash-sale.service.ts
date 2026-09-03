@@ -6,9 +6,8 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Not } from 'typeorm';
+import { Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
-import { v4 as uuidv4 } from 'uuid';
 import { FlashSale, SaleStatus } from './entities/flash-sale.entity.js';
 import { CreateSaleDto } from './dto/create-sale.dto.js';
 import { PurchaseDto } from './dto/purchase.dto.js';
@@ -37,15 +36,14 @@ export class FlashSaleService {
   ): Promise<{ orderId: string; jobId: string }> {
     const quantity = dto.quantity ?? 1;
 
-    // ── 0. Quick fail-fast pre-check (before lock or DB) ────────
-    // Redis GET ~0.1ms — rejects obvious sold-out requests instantly.
-    // NOT the authoritative check (Lua step 4 is). Purpose: stop
-    // 9,999 "definitely sold out" requests before lock acquisition.
+    // ── 0. Quick fail-fast pre-check ────────────────────────────
+    // Redis GET ~0.1ms — stops "definitely sold out" requests before
+    // they reach the atomic Lua step. Not the authoritative check.
     const quickStock = await this.redis.getInventory(saleId);
     if (quickStock <= 0) throw new ConflictException('Sold out');
 
     // ── 1. Validate sale (cache-aside) ──────────────────────────
-    // Cache hit  → Redis ~0.1ms, no DB call (happy path for 10K reqs)
+    // Cache hit  → Redis ~0.1ms, no DB call
     // Cache miss → DB query + cache populated for next request
     let sale = await this.redis.getSaleFromCache<FlashSale>(saleId);
     if (!sale) {
@@ -62,75 +60,60 @@ export class FlashSaleService {
     if (now < new Date(sale.startTime)) throw new BadRequestException('Sale has not started yet');
     if (now > new Date(sale.endTime))   throw new BadRequestException('Sale has ended');
 
-    // ── 2. Acquire distributed lock ─────────────────────────────
-    const lockValue = uuidv4();
-    const locked = await this.redis.acquireLock(saleId, 5000, lockValue);
-    if (!locked) {
-      throw new ConflictException('Sale is busy right now — please retry');
-    }
+    // ── 2. Atomic purchase — inventory + user limit + deduct ────
+    // Single Lua script replaces: distributed lock + DB COUNT + old Lua deduct.
+    // Lua executes atomically in Redis — no serialization, no lock needed.
+    const ttlSeconds = Math.max(
+      Math.ceil((new Date(sale.endTime).getTime() - Date.now()) / 1000),
+      60,
+    );
+    const remaining = await this.redis.atomicPurchase(
+      saleId,
+      userId,
+      quantity,
+      sale.maxPerUser,
+      ttlSeconds,
+    );
 
-    try {
-      // ── 3. Per-user limit check (inside lock) ───────────────────
-      // Must be inside lock: two concurrent requests from same user
-      // would both pass if checked before lock, letting them double-buy.
-      const alreadyBought = await this.orderRepo.count({
-        where: {
-          userId,
-          flashSaleId: saleId,
-          status: Not(OrderStatus.FAILED),
-        },
-      });
-      if (alreadyBought + quantity > sale.maxPerUser) {
-        throw new BadRequestException(
-          `You can only buy ${sale.maxPerUser} item(s) per sale`,
-        );
-      }
+    if (remaining === -2)
+      throw new InternalServerErrorException('Sale inventory not initialized');
+    if (remaining === -3)
+      throw new BadRequestException(`You can only buy ${sale.maxPerUser} item(s) per sale`);
+    if (remaining < 0)
+      throw new ConflictException('Sold out');
 
-      // ── 4. Atomic inventory deduction via Lua ──────────────────
-      const remaining = await this.redis.deductInventory(saleId, quantity);
+    // ── 3. Create PENDING order in DB ──────────────────────────
+    const order = this.orderRepo.create({
+      userId,
+      flashSaleId: saleId,
+      productId: sale.productId,
+      quantity,
+      totalAmount: Number(sale.salePrice) * quantity,
+      status: OrderStatus.PENDING,
+    });
+    const saved = await this.orderRepo.save(order);
 
-      if (remaining === -2)
-        throw new InternalServerErrorException('Sale inventory not initialized');
-      if (remaining < 0)
-        throw new ConflictException('Sold out');
-
-      // ── 5. Create PENDING order in DB ──────────────────────────
-      const order = this.orderRepo.create({
+    // ── 4. Enqueue BullMQ job ───────────────────────────────────
+    const job = await this.orderQueue.add(
+      PROCESS_ORDER_JOB,
+      {
+        orderId: saved.id,
         userId,
-        flashSaleId: saleId,
-        productId: sale.productId,
+        saleId,
         quantity,
-        totalAmount: Number(sale.salePrice) * quantity,
-        status: OrderStatus.PENDING,
-      });
-      const saved = await this.orderRepo.save(order);
+        amount: saved.totalAmount,
+      },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: false,
+        removeOnFail: false,
+      },
+    );
 
-      // ── 6. Enqueue BullMQ job ───────────────────────────────────
-      const job = await this.orderQueue.add(
-        PROCESS_ORDER_JOB,
-        {
-          orderId: saved.id,
-          userId,
-          saleId,
-          quantity,
-          amount: saved.totalAmount,
-        },
-        {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 1000 },
-          removeOnComplete: false,
-          removeOnFail: false,
-        },
-      );
+    await this.orderRepo.update(saved.id, { jobId: job.id.toString() });
 
-      await this.orderRepo.update(saved.id, { jobId: job.id.toString() });
-
-      return { orderId: saved.id, jobId: job.id.toString() };
-
-    } finally {
-      // ── 7. Always release lock (even on error) ──────────────────
-      await this.redis.releaseLock(saleId, lockValue);
-    }
+    return { orderId: saved.id, jobId: job.id.toString() };
   }
 
   async create(dto: CreateSaleDto): Promise<FlashSale> {

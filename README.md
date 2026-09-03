@@ -30,28 +30,24 @@ With this engine:
 ## Architecture
 
 ```
-HTTP Clients (1000+ concurrent)
+HTTP Clients (5000+ concurrent — no lock serialization)
          │
   [NestJS API :3000]
          │
-         ├──→ Step 0: Redis GET inventory:{saleId}   ← instant 409 if sold out (no lock)
+         ├──→ Step 0: Redis GET inventory:{saleId}   ← instant 409 if sold out
          │
          ├──→ Step 1: Redis cache-aside sale lookup  ← avoids DB hit on every request
          │
-         ├──→ Step 2: Redis SET NX EX (distributed lock)
+         ├──→ Step 2: Redis Lua — atomic purchase script (lock-free)
+         │              inventory check  ──→ -1 → 409 Sold out
+         │              user limit check ──→ -3 → 400 Limit exceeded
+         │              not initialised  ──→ -2 → 500 Error
+         │              deduct inventory + increment user_purchases:{userId}:{saleId}
+         │              returns remaining stock N ≥ 0
          │
-         ├──→ Step 3: PostgreSQL — per-user limit check (inside lock)
+         ├──→ Step 3: PostgreSQL — INSERT order (status: PENDING)
          │
-         ├──→ Step 4: Redis Lua — atomic stock deduction
-         │              └── returns -1 → 409 Sold out
-         │              └── returns -2 → 500 Not initialized
-         │              └── returns N  → stock remaining
-         │
-         ├──→ Step 5: PostgreSQL — INSERT order (status: PENDING)
-         │
-         ├──→ Step 6: BullMQ — enqueue PROCESS_ORDER job
-         │
-         └──→ Step 7: Redis — release lock (always, in finally block)
+         └──→ Step 4: BullMQ — enqueue PROCESS_ORDER job
 
 [BullMQ Worker — same process]
   ← picks up job
@@ -72,9 +68,9 @@ HTTP Clients (1000+ concurrent)
 
 Lua executes atomically inside Redis — the check-and-decrement is a single uninterruptible operation. MULTI/EXEC (optimistic locking) can fail under high contention and requires client-side retry logic. Lua always wins on the first attempt.
 
-**2. Distributed lock per sale, not per user**
+**2. User limit check inside the Lua script, not in PostgreSQL**
 
-The lock serializes concurrent writes to the same sale. A per-user lock would allow two requests from the same user to both pass the limit check simultaneously (classic TOCTOU race). The per-user limit check lives *inside* the lock for this exact reason.
+Moving the per-user limit check into the same Lua script that deducts inventory eliminates the need for a distributed lock entirely. A separate DB `COUNT` query inside a lock was the primary bottleneck serializing all concurrent requests. With both checks in Lua, every request runs independently — Redis handles atomicity at the command level.
 
 **3. Redis as stock source of truth during sale window**
 
