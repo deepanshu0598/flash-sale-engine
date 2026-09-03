@@ -1,11 +1,16 @@
 import { Global, Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bull';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { Order } from '../order/entities/order.entity.js';
+import { FlashSale } from '../flash-sale/entities/flash-sale.entity.js';
+import { OrderProcessor } from './order.processor.js';
 import { ORDER_QUEUE } from './queue.constants.js';
 
 @Global()
 @Module({
   imports: [
+    TypeOrmModule.forFeature([Order, FlashSale]),
     BullModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -19,6 +24,7 @@ import { ORDER_QUEUE } from './queue.constants.js';
     }),
     BullModule.registerQueue({ name: ORDER_QUEUE }),
   ],
+  providers: [OrderProcessor],
   exports: [BullModule],
 })
 export class QueueModule {}
