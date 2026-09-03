@@ -62,21 +62,7 @@ export class FlashSaleService {
     if (now < new Date(sale.startTime)) throw new BadRequestException('Sale has not started yet');
     if (now > new Date(sale.endTime))   throw new BadRequestException('Sale has ended');
 
-    // ── 2. Per-user limit check ─────────────────────────────────
-    const alreadyBought = await this.orderRepo.count({
-      where: {
-        userId,
-        flashSaleId: saleId,
-        status: Not(OrderStatus.FAILED),
-      },
-    });
-    if (alreadyBought + quantity > sale.maxPerUser) {
-      throw new BadRequestException(
-        `You can only buy ${sale.maxPerUser} item(s) per sale`,
-      );
-    }
-
-    // ── 3. Acquire distributed lock ─────────────────────────────
+    // ── 2. Acquire distributed lock ─────────────────────────────
     const lockValue = uuidv4();
     const locked = await this.redis.acquireLock(saleId, 5000, lockValue);
     if (!locked) {
@@ -84,6 +70,22 @@ export class FlashSaleService {
     }
 
     try {
+      // ── 3. Per-user limit check (inside lock) ───────────────────
+      // Must be inside lock: two concurrent requests from same user
+      // would both pass if checked before lock, letting them double-buy.
+      const alreadyBought = await this.orderRepo.count({
+        where: {
+          userId,
+          flashSaleId: saleId,
+          status: Not(OrderStatus.FAILED),
+        },
+      });
+      if (alreadyBought + quantity > sale.maxPerUser) {
+        throw new BadRequestException(
+          `You can only buy ${sale.maxPerUser} item(s) per sale`,
+        );
+      }
+
       // ── 4. Atomic inventory deduction via Lua ──────────────────
       const remaining = await this.redis.deductInventory(saleId, quantity);
 
