@@ -96,6 +96,20 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return val !== null ? parseInt(val, 10) : 0;
   }
 
+  // ─── Sale Cache (cache-aside) ─────────────────────────────────────────────
+  async getSaleFromCache<T>(saleId: string): Promise<T | null> {
+    const val = await this.client.get(`sale:${saleId}`);
+    return val ? (JSON.parse(val) as T) : null;
+  }
+
+  async setSaleCache<T>(saleId: string, data: T, ttlSeconds = 60): Promise<void> {
+    await this.client.setex(`sale:${saleId}`, ttlSeconds, JSON.stringify(data));
+  }
+
+  async invalidateSaleCache(saleId: string): Promise<void> {
+    await this.client.del(`sale:${saleId}`);
+  }
+
   getClient(): Redis {
     return this.client;
   }

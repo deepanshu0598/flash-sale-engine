@@ -37,15 +37,30 @@ export class FlashSaleService {
   ): Promise<{ orderId: string; jobId: string }> {
     const quantity = dto.quantity ?? 1;
 
-    // ── 1. Validate sale ────────────────────────────────────────
-    const sale = await this.saleRepo.findOne({ where: { id: saleId } });
-    if (!sale) throw new NotFoundException('Sale not found');
+    // ── 0. Quick fail-fast pre-check (before lock or DB) ────────
+    // Redis GET ~0.1ms — rejects obvious sold-out requests instantly.
+    // NOT the authoritative check (Lua step 4 is). Purpose: stop
+    // 9,999 "definitely sold out" requests before lock acquisition.
+    const quickStock = await this.redis.getInventory(saleId);
+    if (quickStock <= 0) throw new ConflictException('Sold out');
+
+    // ── 1. Validate sale (cache-aside) ──────────────────────────
+    // Cache hit  → Redis ~0.1ms, no DB call (happy path for 10K reqs)
+    // Cache miss → DB query + cache populated for next request
+    let sale = await this.redis.getSaleFromCache<FlashSale>(saleId);
+    if (!sale) {
+      const found = await this.saleRepo.findOne({ where: { id: saleId } });
+      if (!found) throw new NotFoundException('Sale not found');
+      await this.redis.setSaleCache(saleId, found, 60);
+      sale = found;
+    }
+
     if (sale.status !== SaleStatus.ACTIVE)
       throw new BadRequestException('Sale is not active');
 
     const now = new Date();
-    if (now < sale.startTime) throw new BadRequestException('Sale has not started yet');
-    if (now > sale.endTime)   throw new BadRequestException('Sale has ended');
+    if (now < new Date(sale.startTime)) throw new BadRequestException('Sale has not started yet');
+    if (now > new Date(sale.endTime))   throw new BadRequestException('Sale has ended');
 
     // ── 2. Per-user limit check ─────────────────────────────────
     const alreadyBought = await this.orderRepo.count({
@@ -138,6 +153,7 @@ export class FlashSaleService {
 
     const saved = await this.saleRepo.save(sale);
     await this.redis.initInventory(saved.id, saved.totalStock);
+    await this.redis.setSaleCache(saved.id, saved, 3600);
     return saved;
   }
 
