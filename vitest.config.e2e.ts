@@ -7,5 +7,7 @@ export default defineConfig({
     globals: true,
     root: './',
     include: ['**/*.e2e-spec.ts'],
+    fileParallelism: false, // E2E tests share DB + Redis — must run sequentially
+    testTimeout: 30_000,
   },
 });
