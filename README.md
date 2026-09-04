@@ -154,22 +154,11 @@ nginx         → worker_processes auto, worker_connections 16384, multi_accept 
 4 replicas × ~2.5K = 10K+ theoretical throughput
 ```
 
-To run the 10K VU test on a Linux server:
-
-```bash
-# Tune kernel (Linux only)
-sysctl -w net.core.somaxconn=65535
-sysctl -w net.ipv4.tcp_max_syn_backlog=65535
-ulimit -n 65535
-
-# Run — k6 config is env-driven
-MAX_VUS=10000 POOL_SIZE=500 k6 run \
-  --env BASE_URL=http://<server>:3000 \
-  --env SALE_ID=<sale-id> \
-  --env MAX_VUS=10000 \
-  --env POOL_SIZE=500 \
-  test/load/flash-sale.k6.js
-```
+A complete, copy-paste-ready runbook (VM provisioning, kernel tuning, sale setup, exact k6
+invocation, what metrics to check in Grafana) is at
+[`docs/load-test-10k-runbook.md`](docs/load-test-10k-runbook.md) — not yet run, since it needs
+cloud infrastructure this environment doesn't have access to. A distributed multi-region variant
+using k6 Cloud is at [`docs/k6-cloud-runbook.md`](docs/k6-cloud-runbook.md).
 
 ---
 
@@ -366,13 +355,17 @@ schema-creation path. All four are now done.
 | ✓ Structured JSON logging via Pino — `nestjs-pino` overrides Nest's logger app-wide (every existing `Logger` call across every service becomes structured JSON automatically, zero files touched), plus `pino-http` auto-logs every request with a `reqId`/method/route/status/`responseTime`. `Authorization`/`Cookie` headers redacted. Pretty-printed locally, raw JSON in production (verified both). Deliberately *not* request-scoping providers to inject `userId`/`saleId` into every business-logic log line — that would recreate `FlashSaleService`'s whole DI subgraph per request, unacceptable on the purchase hot path; `orderId`/`saleId` already appear in the existing log messages as plain text. | Medium | ~2h |
 | ✓ OpenAPI response schemas — `@nestjs/swagger` CLI plugin enabled (auto-infers DTO schemas from `class-validator` decorators, no per-field `@ApiProperty()` needed) plus explicit `@ApiResponse`/`@ApiBearerAuth`/`@ApiHeader` on every endpoint across all 4 controllers. | Low | ~1h |
 
-### Phase 4 — Validation (~4h)
+### Phase 4 — Validation
 
 | Item | Priority | Effort |
 |---|---|---|
-| 10K VU test on a tuned Linux cloud VM (Windows TCP backlog blocks this locally) | Medium | ~2h |
-| GitHub PR-based workflow (branch protection, require CI pass) | Low | ~30m |
-| k6 Cloud / distributed load test (multi-agent, no script changes needed) | Low | ~1.5h |
+| ✓ GitHub PR-based workflow — branch protection live on `master` (PR required, `test` + `docker-build` must pass, no force-push/delete), PR template added, CI's `push` trigger scoped to feature branches only (`master` is covered by `pull_request`) | Low | ~30m |
+| 📋 10K VU test on a tuned Linux cloud VM — needs an AWS account (out of this session's access); full copy-paste runbook ready at [`docs/load-test-10k-runbook.md`](docs/load-test-10k-runbook.md) + [`scripts/tune-kernel-for-load-test.sh`](scripts/tune-kernel-for-load-test.sh) | Medium | ~2h |
+| 📋 k6 Cloud / distributed load test — needs a k6 Cloud account (out of this session's access); runbook ready at [`docs/k6-cloud-runbook.md`](docs/k6-cloud-runbook.md), no script changes required | Low | ~1.5h |
+
+**Note on branch protection:** `enforce_admins` is `false` — as the repo admin you can still push
+directly to `master` if needed (avoids a solo-dev lockout risk). To make the PR requirement apply
+to admins too: `gh api --method PATCH repos/deepanshu0598/flash-sale-engine/branches/master/protection/enforce_admins`.
 
 ---
 

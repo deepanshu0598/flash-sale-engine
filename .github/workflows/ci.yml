@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # master is branch-protected (PR required, direct pushes blocked) — CI on
+  # master only needs to run via the pull_request trigger below. Feature
+  # branches still get push-triggered CI for fast feedback before a PR exists.
   push:
-    branches: [master, develop, development]
+    branches: [develop, development]
   pull_request:
     branches: [master]
 
