@@ -21,3 +21,6 @@ Thumbs.db
 
 # Test coverage
 coverage/
+SESSION_HANDOFF.md
+flash-sale-engine-plan.md
+tsconfig.build.tsbuildinfo
