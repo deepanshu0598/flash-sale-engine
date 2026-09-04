@@ -19,7 +19,10 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     this.client = new Redis({
       host: this.config.get<string>('redis.host'),
       port: this.config.get<number>('redis.port'),
-      retryStrategy: (times: number) => Math.min(times * 100, 3000),
+      retryStrategy: (times: number) => Math.min(times * 50, 2000),
+      connectTimeout: 10_000,
+      maxRetriesPerRequest: 3,
+      enableOfflineQueue: true,
     });
 
     this.client.on('connect', () => this.logger.log('Redis connected'));
