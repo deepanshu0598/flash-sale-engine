@@ -334,14 +334,14 @@ schema-creation path. All four are now done.
 | ✓ Fixed replica scaling — removed the no-op `deploy.replicas`, documented `docker compose up -d --scale app=4` as the real command | Low | ~15m |
 | ✓ **Bonus fix found during this pass:** `synchronize: true` was unconditional in `app.module.ts` (a production-DDL risk that contradicted the migration workflow) — now gated to non-production only, with `migrationsRun: true` in production | — | — |
 
-### Phase 1 — Quick Wins (~4.5h)
+### Phase 1 — Quick Wins ✓ shipped
 
 | Item | Priority | Effort |
 |---|---|---|
-| Rate limiting on `/purchase` (Redis sliding window, per-user + per-IP) | High | ~2h |
-| Sale init guard (auto-rebuild `inventory:{saleId}` from DB if the Redis key is lost) | High | ~1h |
-| Graceful shutdown (drain in-flight requests + jobs on SIGTERM) | Medium | ~1h |
-| Redis key TTL alert (warn before `inventory:{saleId}` expires unexpectedly) | Medium | ~30m |
+| ✓ Rate limiting on `/purchase` — Redis fixed-window counter, 5 req/10s per user + 20 req/10s per IP, `429` on breach | High | ~2h |
+| ✓ Sale init guard — `getInventoryOrNull()` distinguishes "sold out" from "Redis lost the key"; self-heals from DB (`totalStock − soldCount`) via NX writes, with one retry if the race is still open | High | ~1h |
+| ✓ Graceful shutdown — `app.enableShutdownHooks()` + a `QueueShutdownService` (`@nestjs/bull` doesn't drain queues on its own); verified with a real `docker stop` against the built image | Medium | ~1h |
+| ✓ Redis key TTL alert — merged into the init guard as a reactive warn log, since `inventory:{saleId}` is set with no TTL by design (see code comment for why a literal "TTL < 60s" check doesn't apply here) | Medium | ~30m |
 
 ### Phase 2 — Reliability (~11h)
 

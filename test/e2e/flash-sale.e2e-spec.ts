@@ -128,14 +128,25 @@ describe('Flash Sale Engine (e2e)', () => {
   });
 
   describe('Sold out', () => {
-    it('returns 409 immediately when stock is 0', async () => {
-      const token     = await registerAndLogin();
-      const productId = await createProduct(token);
-      const saleId    = await createSale(token, productId, 0);
+    it('returns 409 once stock is exhausted', async () => {
+      // totalStock has @Min(1) — a sale can't be created with stock: 0, so this
+      // exercises the real sold-out path (Lua deduct to 0, then reject) rather
+      // than relying on a sale that was never actually created.
+      const buyerToken = await registerAndLogin();
+      const productId  = await createProduct(buyerToken);
+      const saleId     = await createSale(buyerToken, productId, 1);
 
       await http()
         .post(`/flash-sales/${saleId}/purchase`)
-        .set('Authorization', `Bearer ${token}`)
+        .set('Authorization', `Bearer ${buyerToken}`)
+        .send({ quantity: 1 })
+        .expect(201);
+
+      // Different user so maxPerUser=1 isn't what rejects the second attempt
+      const secondToken = await registerAndLogin();
+      await http()
+        .post(`/flash-sales/${saleId}/purchase`)
+        .set('Authorization', `Bearer ${secondToken}`)
         .send({ quantity: 1 })
         .expect(409);
     }, 15_000);

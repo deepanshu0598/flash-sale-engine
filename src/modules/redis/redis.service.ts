@@ -119,6 +119,24 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return val !== null ? parseInt(val, 10) : 0;
   }
 
+  // Distinguishes "genuinely 0 stock" from "key missing entirely" — getInventory()
+  // collapses both to 0, which is fine for display but wrong for the purchase
+  // flow's Sale Init Guard (a missing key means Redis lost the sale's inventory,
+  // not that it sold out).
+  async getInventoryOrNull(saleId: string): Promise<number | null> {
+    const val = await this.client.get(`inventory:${saleId}`);
+    return val !== null ? parseInt(val, 10) : null;
+  }
+
+  // NX-based reinit for the Sale Init Guard: only sets keys that are actually
+  // missing, so concurrent requests racing to self-heal the same sale don't
+  // stomp each other's writes (unlike initInventory(), which is an unconditional
+  // overwrite meant for first-time sale creation).
+  async reinitInventoryIfMissing(saleId: string, stock: number): Promise<void> {
+    await this.client.set(`inventory:${saleId}`, stock, 'NX');
+    await this.client.set(`sold:${saleId}`, 0, 'NX');
+  }
+
   async getSoldCount(saleId: string): Promise<number> {
     const val = await this.client.get(`sold:${saleId}`);
     return val !== null ? parseInt(val, 10) : 0;
@@ -140,5 +158,19 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
   getClient(): Redis {
     return this._pool[0];
+  }
+
+  // ─── Rate Limiting (fixed window) ──────────────────────────────────────────
+  // INCR is atomic — concurrent first requests can't both "win" the count===1
+  // check, so only one of them sets the window's expiry. Fixed-window (not a
+  // true sliding window) is intentional: good enough for abuse throttling,
+  // far simpler than a sorted-set sliding window, and consistent with this
+  // service's existing style of small, explicit Redis primitives.
+  async incrementRateLimitCounter(key: string, windowSeconds: number): Promise<number> {
+    const count = await this.client.incr(key);
+    if (count === 1) {
+      await this.client.expire(key, windowSeconds);
+    }
+    return count;
   }
 }

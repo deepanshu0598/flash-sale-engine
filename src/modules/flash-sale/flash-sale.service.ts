@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   BadRequestException,
   ConflictException,
@@ -18,6 +19,8 @@ import { ORDER_QUEUE, PROCESS_ORDER_JOB } from '../queue/queue.constants.js';
 
 @Injectable()
 export class FlashSaleService {
+  private readonly logger = new Logger(FlashSaleService.name);
+
   constructor(
     @InjectRepository(FlashSale)
     private readonly saleRepo: Repository<FlashSale>,
@@ -39,8 +42,11 @@ export class FlashSaleService {
     // ── 0. Quick fail-fast pre-check ────────────────────────────
     // Redis GET ~0.1ms — stops "definitely sold out" requests before
     // they reach the atomic Lua step. Not the authoritative check.
-    const quickStock = await this.redis.getInventory(saleId);
-    if (quickStock <= 0) throw new ConflictException('Sold out');
+    // A `null` result (key doesn't exist) is NOT the same as sold out — it
+    // means Redis lost this sale's inventory key (restart, eviction). That
+    // case falls through to the Sale Init Guard below instead of a false 409.
+    const quickStock = await this.redis.getInventoryOrNull(saleId);
+    if (quickStock !== null && quickStock <= 0) throw new ConflictException('Sold out');
 
     // ── 1. Validate sale (cache-aside) ──────────────────────────
     // Cache hit  → Redis ~0.1ms, no DB call
@@ -60,6 +66,19 @@ export class FlashSaleService {
     if (now < new Date(sale.startTime)) throw new BadRequestException('Sale has not started yet');
     if (now > new Date(sale.endTime))   throw new BadRequestException('Sale has ended');
 
+    // ── 1.5 Sale Init Guard ─────────────────────────────────────
+    // quickStock === null means inventory:{saleId} doesn't exist even though
+    // the sale is ACTIVE in the DB — Redis lost it (restart without AOF
+    // persistence, maxmemory-lru eviction, or a manual DEL). Rebuild a
+    // best-effort count from the DB instead of failing every purchase with a
+    // hard 500 for the rest of the sale. This is a best-effort reconstruction
+    // (DB soldCount can lag Redis by a few in-flight orders), not an exact
+    // reconciliation — the periodic Redis↔DB reconciliation job (roadmap
+    // Phase 2) is what closes that drift precisely.
+    if (quickStock === null) {
+      await this.ensureInventoryInitialized(sale);
+    }
+
     // ── 2. Atomic purchase — inventory + user limit + deduct ────
     // Single Lua script replaces: distributed lock + DB COUNT + old Lua deduct.
     // Lua executes atomically in Redis — no serialization, no lock needed.
@@ -67,13 +86,21 @@ export class FlashSaleService {
       Math.ceil((new Date(sale.endTime).getTime() - Date.now()) / 1000),
       60,
     );
-    const remaining = await this.redis.atomicPurchase(
+    let remaining = await this.redis.atomicPurchase(
       saleId,
       userId,
       quantity,
       sale.maxPerUser,
       ttlSeconds,
     );
+
+    // -2 here means the guard above raced with another eviction, or ran but
+    // NX lost to a concurrent reinit that hadn't landed yet. One retry is
+    // enough — this path should be rare in practice.
+    if (remaining === -2) {
+      await this.ensureInventoryInitialized(sale);
+      remaining = await this.redis.atomicPurchase(saleId, userId, quantity, sale.maxPerUser, ttlSeconds);
+    }
 
     if (remaining === -2)
       throw new InternalServerErrorException('Sale inventory not initialized');
@@ -114,6 +141,26 @@ export class FlashSaleService {
     await this.orderRepo.update(saved.id, { jobId: job.id.toString() });
 
     return { orderId: saved.id, jobId: job.id.toString() };
+  }
+
+  // Rebuilds inventory:{saleId} / sold:{saleId} from the DB when Redis has
+  // lost them mid-sale. Uses NX writes (via RedisService.reinitInventoryIfMissing)
+  // so concurrent purchase() calls racing to self-heal the same sale don't
+  // clobber each other.
+  //
+  // This also doubles as the "Redis key lost" alert: inventory:{saleId} is set
+  // with no TTL (see redis.service.ts initInventory) — it doesn't expire on a
+  // timer, so a plain "TTL < 60s" check would never fire. The real risk here is
+  // eviction under `maxmemory-policy allkeys-lru` (docker/redis.conf) or a
+  // restart without persistence. This log line is the actual observable signal
+  // for that: it fires exactly when a purchase discovers the key is gone.
+  private async ensureInventoryInitialized(sale: FlashSale): Promise<void> {
+    const rebuiltStock = Math.max(sale.totalStock - sale.soldCount, 0);
+    this.logger.warn(
+      `inventory:${sale.id} was missing from Redis — reinitializing from DB ` +
+      `(totalStock=${sale.totalStock}, soldCount=${sale.soldCount}, rebuilt=${rebuiltStock})`,
+    );
+    await this.redis.reinitInventoryIfMissing(sale.id, rebuiltStock);
   }
 
   async create(dto: CreateSaleDto): Promise<FlashSale> {

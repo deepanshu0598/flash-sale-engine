@@ -12,6 +12,7 @@ import { FlashSaleService } from './flash-sale.service.js';
 import { CreateSaleDto } from './dto/create-sale.dto.js';
 import { PurchaseDto } from './dto/purchase.dto.js';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
+import { PurchaseRateLimitGuard } from '../../common/guards/purchase-rate-limit.guard.js';
 
 @Controller('flash-sales')
 export class FlashSaleController {
@@ -33,7 +34,7 @@ export class FlashSaleController {
   }
 
   @Post(':id/purchase')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, PurchaseRateLimitGuard)
   purchase(@Param('id') id: string, @Body() dto: PurchaseDto, @Req() req: Request) {
     const user = req.user as { id: string };
     return this.flashSaleService.purchase(user.id, id, dto);

@@ -5,6 +5,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Order } from '../order/entities/order.entity.js';
 import { FlashSale } from '../flash-sale/entities/flash-sale.entity.js';
 import { OrderProcessor } from './order.processor.js';
+import { QueueShutdownService } from './queue-shutdown.service.js';
 import { ORDER_QUEUE } from './queue.constants.js';
 
 @Global()
@@ -24,7 +25,7 @@ import { ORDER_QUEUE } from './queue.constants.js';
     }),
     BullModule.registerQueue({ name: ORDER_QUEUE }),
   ],
-  providers: [OrderProcessor],
+  providers: [OrderProcessor, QueueShutdownService],
   exports: [BullModule],
 })
 export class QueueModule {}

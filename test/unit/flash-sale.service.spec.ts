@@ -23,10 +23,12 @@ const orderRepo = {
 };
 
 const redisService = {
-  getInventory:     vi.fn(),
-  getSaleFromCache: vi.fn(),
-  setSaleCache:     vi.fn(),
-  atomicPurchase:   vi.fn(),
+  getInventory:               vi.fn(),
+  getInventoryOrNull:         vi.fn(),
+  reinitInventoryIfMissing:   vi.fn(),
+  getSaleFromCache:           vi.fn(),
+  setSaleCache:               vi.fn(),
+  atomicPurchase:             vi.fn(),
 };
 
 const productService = { findOne: vi.fn() };
@@ -69,6 +71,8 @@ beforeEach(() => {
 
   // Default happy-path stubs (overridden per test as needed)
   redisService.getInventory.mockResolvedValue(50);
+  redisService.getInventoryOrNull.mockResolvedValue(50);
+  redisService.reinitInventoryIfMissing.mockResolvedValue(undefined);
   redisService.getSaleFromCache.mockResolvedValue(mockSale);
   redisService.setSaleCache.mockResolvedValue(undefined);
   redisService.atomicPurchase.mockResolvedValue(49);  // remaining stock after deduction
@@ -85,13 +89,65 @@ describe('FlashSaleService.purchase()', () => {
   // ── Step 0: Quick pre-check ─────────────────────────────────────────────────
   describe('Step 0 — quick pre-check', () => {
     it('throws 409 immediately when quickStock is 0 — no Lua, no DB', async () => {
-      redisService.getInventory.mockResolvedValue(0);
+      redisService.getInventoryOrNull.mockResolvedValue(0);
 
       await expect(service.purchase(userId, saleId, dto))
         .rejects.toThrow(ConflictException);
 
       expect(redisService.atomicPurchase).not.toHaveBeenCalled();
       expect(saleRepo.findOne).not.toHaveBeenCalled();
+    });
+
+    it('does NOT throw 409 when the key is missing (null) — falls through to the guard', async () => {
+      redisService.getInventoryOrNull.mockResolvedValue(null);
+
+      const result = await service.purchase(userId, saleId, dto);
+
+      expect(result).toEqual({ orderId: 'order-uuid', jobId: 'job-1' });
+    });
+  });
+
+  // ── Sale Init Guard ──────────────────────────────────────────────────────────
+  describe('Sale Init Guard — Redis inventory key missing', () => {
+    it('reinitializes from DB (totalStock - soldCount) when quickStock is null', async () => {
+      redisService.getInventoryOrNull.mockResolvedValue(null);
+
+      await service.purchase(userId, saleId, dto);
+
+      expect(redisService.reinitInventoryIfMissing).toHaveBeenCalledWith(
+        saleId,
+        mockSale.totalStock - mockSale.soldCount,
+      );
+    });
+
+    it('does NOT call reinitInventoryIfMissing when quickStock is a real number', async () => {
+      redisService.getInventoryOrNull.mockResolvedValue(50);
+
+      await service.purchase(userId, saleId, dto);
+
+      expect(redisService.reinitInventoryIfMissing).not.toHaveBeenCalled();
+    });
+
+    it('retries atomicPurchase once when Lua still returns -2 after the guard, and succeeds on retry', async () => {
+      redisService.getInventoryOrNull.mockResolvedValue(null);
+      redisService.atomicPurchase
+        .mockResolvedValueOnce(-2)  // first attempt: still not initialized
+        .mockResolvedValueOnce(49); // retry after reinit: succeeds
+
+      const result = await service.purchase(userId, saleId, dto);
+
+      expect(redisService.atomicPurchase).toHaveBeenCalledTimes(2);
+      expect(redisService.reinitInventoryIfMissing).toHaveBeenCalledTimes(2); // Step 1.5 + retry path
+      expect(result).toEqual({ orderId: 'order-uuid', jobId: 'job-1' });
+    });
+
+    it('gives up with InternalServerErrorException when Lua still returns -2 after the retry', async () => {
+      redisService.atomicPurchase.mockResolvedValue(-2);
+
+      await expect(service.purchase(userId, saleId, dto))
+        .rejects.toThrow(InternalServerErrorException);
+
+      expect(redisService.atomicPurchase).toHaveBeenCalledTimes(2);
     });
   });
 
