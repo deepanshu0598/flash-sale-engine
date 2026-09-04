@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, develop]
+    branches: [master, develop, development]
   pull_request:
     branches: [master]
 
@@ -66,3 +66,11 @@ jobs:
 
       - name: E2E tests
         run: npm run test:e2e
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t flash-sale-engine:ci .
