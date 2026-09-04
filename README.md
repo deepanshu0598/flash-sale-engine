@@ -239,10 +239,12 @@ npm run start:dev
 ### Production mode (4 replicas + nginx)
 
 ```bash
-# 1. Build and start all services
-docker compose up -d --build
+# 1. Build and start all services, scaled to 4 app replicas
+#    (--scale is required — `deploy.replicas` in docker-compose.yml only
+#    takes effect in Swarm mode, it's a no-op under plain `docker compose up`)
+docker compose up -d --build --scale app=4
 
-# 2. Run migrations
+# 2. Run migrations (app container also runs these automatically on boot in production)
 npm run migration:run
 
 # 3. Seed data
@@ -319,17 +321,18 @@ approach) lives in the published roadmap artifact; this table is the at-a-glance
 
 **19 items · ~30h total · 8 high priority · 2 deploy blockers**
 
-### Phase 0 — Tech Debt (do first)
+### Phase 0 — Tech Debt ✓ shipped
 
-Two items here block a clean production deploy — a fresh database currently has no committed
-schema-creation path.
+Two items here blocked a clean production deploy — a fresh database had no committed
+schema-creation path. All four are now done.
 
 | Item | Priority | Effort |
 |---|---|---|
-| Generate initial DB migration (`src/database/migrations/` is empty; CI's `migration:run` is a silent no-op) | **Blocker** | ~1h |
-| Add FK relations + indexes on `orders` (currently plain UUID columns, no FKs, no indexes on `userId`/`flashSaleId`) | **Blocker** | ~1.5h |
-| Dependency cleanup: both `bull` and `bullmq` installed, only `@nestjs/bull` used | Low | ~30m |
-| Fix replica scaling docs (`deploy: replicas: 4` is a no-op under plain `docker compose up`) | Low | ~15m |
+| ✓ Generate initial DB migration — `InitialSchema`, includes all 4 tables, enums, FKs, and indexes; verified `up`/`down` against a throwaway empty DB | **Blocker** | ~1h |
+| ✓ Add FK relations + composite index on `orders` (`userId`+`flashSaleId` FKs to users/flash_sales/products, plus a composite index covering both "my orders" and per-sale lookups) | **Blocker** | ~1.5h |
+| ✓ Dependency cleanup — removed unused `bullmq` package (only `@nestjs/bull`/`bull` are actually used) | Low | ~30m |
+| ✓ Fixed replica scaling — removed the no-op `deploy.replicas`, documented `docker compose up -d --scale app=4` as the real command | Low | ~15m |
+| ✓ **Bonus fix found during this pass:** `synchronize: true` was unconditional in `app.module.ts` (a production-DDL risk that contradicted the migration workflow) — now gated to non-production only, with `migrationsRun: true` in production | — | — |
 
 ### Phase 1 — Quick Wins (~4.5h)
 

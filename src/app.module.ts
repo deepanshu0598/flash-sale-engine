@@ -36,7 +36,11 @@ import { ORDER_QUEUE } from './modules/queue/queue.constants.js';
         password: config.get<string>('database.password'),
         database: config.get<string>('database.name'),
         autoLoadEntities: true,
-        synchronize: true,
+        // synchronize is dev/test convenience only — production schema changes
+        // go through committed migrations (npm run migration:run), never auto-DDL.
+        synchronize: config.get<string>('app.nodeEnv') !== 'production',
+        migrations: ['dist/database/migrations/*.js'],
+        migrationsRun: config.get<string>('app.nodeEnv') === 'production',
         extra: {
           max: 50,  // pg pool size: handles burst of concurrent INSERTs (default 10)
           idleTimeoutMillis: 30_000,

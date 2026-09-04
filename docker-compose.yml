@@ -61,8 +61,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    deploy:
-      replicas: 4
+    # `deploy.replicas` only takes effect in Swarm mode — it is a no-op under
+    # plain `docker compose up`. To actually run 4 replicas behind nginx, use:
+    #   docker compose up -d --scale app=4
 
   nginx:
     image: nginx:alpine
