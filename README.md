@@ -189,22 +189,24 @@ Expected throughput: 4 instances × 5K = **10K+ concurrent**.
 
 ### Scaling Roadmap Summary
 
-| Phase | Change | Effort | Concurrent |
-|-------|--------|--------|-----------|
-| v1.0 (current) | Single instance + distributed lock | — | ~1K |
-| Phase 1 | Lock TTL + DB pool | 1 day | ~2K |
-| Phase 2 | Lock-free Lua (user limit in Redis) | 2-3 days | ~5K |
-| Phase 3 | 4 replicas + nginx | 1-2 days | **10K+** |
+| Phase | Change | Effort | Concurrent | Status |
+|-------|--------|--------|-----------|--------|
+| v1.0 | Single instance + distributed lock | — | ~1K | ✓ shipped |
+| Phase 1 | Lock TTL + DB pool | 1 day | ~2K | planned |
+| Phase 2 | Lock-free Lua (user limit in Redis) | 2-3 days | ~5K | ✓ shipped |
+| Phase 3 | 4 replicas + nginx | 1-2 days | **10K+** | ✓ shipped |
 
 ---
 
 ## Quick Start
 
+### Local development (single instance)
+
 **Prerequisites:** Docker, Node.js 20+
 
 ```bash
-# 1. Start infrastructure
-docker-compose up -d
+# 1. Start infrastructure (postgres + redis only)
+docker-compose up -d postgres redis
 
 # 2. Install dependencies
 npm install
@@ -217,6 +219,22 @@ npm run seed
 
 # 5. Start the server
 npm run start:dev
+```
+
+### Production mode (4 replicas + nginx)
+
+```bash
+# 1. Build and start all services (postgres, redis, 4 app replicas, nginx)
+docker-compose up -d --build
+
+# 2. Run migrations (one-off — runs against postgres via localhost:5432)
+npm run migration:run
+
+# 3. Seed data
+npm run seed
+
+# App is now available at http://localhost:3000 via nginx
+# nginx distributes requests across 4 NestJS instances automatically
 ```
 
 **Test the purchase flow:**
