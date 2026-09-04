@@ -172,6 +172,13 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return this._pool[0];
   }
 
+  // How many of the pool's 5 connections are actually 'ready' right now —
+  // fault tolerance only helps if you can see when it's degraded, so this
+  // backs the redis_pool_connected gauge (metrics module).
+  getConnectedCount(): number {
+    return this._pool.filter((c) => c.status === 'ready').length;
+  }
+
   // ─── Idempotency (purchase dedup on client retry) ──────────────────────────
   // Two-phase: claim the key first (NX — only one concurrent request can win
   // it), do the work, then overwrite the claim with the real result. A

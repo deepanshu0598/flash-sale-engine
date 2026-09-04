@@ -1,10 +1,15 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module.js';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // bufferLogs holds Nest's own startup log lines until useLogger() below
+  // swaps in Pino, so bootstrap messages come out as structured JSON too
+  // instead of a handful of unstructured lines before the switch happens.
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  app.useLogger(app.get(Logger));
 
   // Wires SIGTERM/SIGINT to app.close(), which runs every module's
   // onModuleDestroy/onApplicationShutdown hook — Redis pool quit,

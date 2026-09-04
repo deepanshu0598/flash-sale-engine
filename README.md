@@ -251,6 +251,9 @@ npm run migration:run
 npm run seed
 
 # App at http://localhost:3000 via nginx → 4 NestJS replicas
+# Prometheus at http://localhost:9090
+# Grafana at    http://localhost:3001 (admin / admin, or set GRAFANA_ADMIN_PASSWORD)
+#   → "Flash Sale Engine" dashboard is auto-provisioned, no manual setup needed
 ```
 
 **Test the purchase flow:**
@@ -310,6 +313,7 @@ BASE_URL=http://localhost:3000 SALE_ID=<sale-id> k6 run test/load/flash-sale.k6.
 | GET | `/orders/:id` | Track order status |
 | GET | `/health` | Health check |
 | GET | `/queues` | Bull Board job monitor |
+| GET | `/metrics` | Prometheus scrape endpoint |
 | GET | `/api` | Swagger UI |
 
 ---
@@ -354,13 +358,13 @@ schema-creation path. All four are now done.
 | ✓ Sale status endpoint — `GET /flash-sales/:id/status`, live stock + sold + time remaining, sale metadata from the existing cache (no DB hit on the hot path) | Medium | ~1h |
 | ✓ Order webhook — optional `webhookUrl` on sale creation, server-generates a one-time-revealed `webhookSecret`, HMAC-SHA256-signed POST fired on order CONFIRMED via native `fetch` (no new HTTP client dependency); delivery failure is logged and never affects the order itself | Medium | ~3h |
 
-### Phase 3 — Observability (~7h)
+### Phase 3 — Observability ✓ shipped
 
 | Item | Priority | Effort |
 |---|---|---|
-| Prometheus + Grafana dashboard (req/s, p99, queue depth, pool health) | High | ~4h |
-| Structured JSON logging via Pino (requestId/userId/saleId per log line) | Medium | ~2h |
-| OpenAPI response schemas on every endpoint | Low | ~1h |
+| ✓ Prometheus + Grafana — custom metrics (`purchases_total` by outcome, HTTP latency histogram, order-queue depth, Redis pool health, DB pool usage) plus free Node/process metrics; 6-panel dashboard auto-provisioned on Grafana boot. Verified end-to-end: built the image, brought up the real stack, confirmed Prometheus scrapes `/metrics` (`health: up`), queried a live gauge back out, and confirmed all 6 dashboard panels load without schema errors. | High | ~4h |
+| ✓ Structured JSON logging via Pino — `nestjs-pino` overrides Nest's logger app-wide (every existing `Logger` call across every service becomes structured JSON automatically, zero files touched), plus `pino-http` auto-logs every request with a `reqId`/method/route/status/`responseTime`. `Authorization`/`Cookie` headers redacted. Pretty-printed locally, raw JSON in production (verified both). Deliberately *not* request-scoping providers to inject `userId`/`saleId` into every business-logic log line — that would recreate `FlashSaleService`'s whole DI subgraph per request, unacceptable on the purchase hot path; `orderId`/`saleId` already appear in the existing log messages as plain text. | Medium | ~2h |
+| ✓ OpenAPI response schemas — `@nestjs/swagger` CLI plugin enabled (auto-infers DTO schemas from `class-validator` decorators, no per-field `@ApiProperty()` needed) plus explicit `@ApiResponse`/`@ApiBearerAuth`/`@ApiHeader` on every endpoint across all 4 controllers. | Low | ~1h |
 
 ### Phase 4 — Validation (~4h)
 
@@ -383,6 +387,9 @@ schema-creation path. All four are now done.
 | Queue | BullMQ + @nestjs/bull |
 | Auth | JWT + Passport |
 | Proxy | nginx (round-robin, 4 replicas) |
+| Logging | Pino (`nestjs-pino`) — structured JSON, request-correlated |
+| Metrics | Prometheus (`@willsoto/nestjs-prometheus`) + Grafana |
+| API Docs | Swagger/OpenAPI (`@nestjs/swagger`, CLI plugin) |
 | Testing | Vitest + supertest |
 | Load Testing | k6 (200 per-VU tokens) |
 | CI | GitHub Actions (unit + e2e + docker-build) |

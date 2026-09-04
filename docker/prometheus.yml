@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: flash-sale-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['app:3000']
+    # NOTE: `app` resolves via Docker's internal DNS round-robin across all
+    # replicas (same mechanism nginx uses — see docker/nginx.conf). With
+    # multiple replicas (`docker compose up --scale app=4`), each scrape only
+    # ever reaches ONE random replica, not all of them — this setup does not
+    # aggregate per-replica metrics into cluster totals. Real per-replica
+    # visibility needs a service discovery mechanism (Swarm/K8s SD, or a
+    # static target list of container IPs) that this docker-compose setup
+    # doesn't provide. Fine for a single-instance dev/demo Grafana view;
+    # flagged here rather than silently pretending it's cluster-wide.

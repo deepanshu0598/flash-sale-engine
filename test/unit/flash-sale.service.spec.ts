@@ -40,6 +40,8 @@ const productService = { findOne: vi.fn() };
 
 const orderQueue = { add: vi.fn() };
 
+const purchasesTotal = { inc: vi.fn() };
+
 // ─── Shared fixtures ──────────────────────────────────────────────────────────
 
 const userId  = 'user-uuid';
@@ -72,6 +74,7 @@ beforeEach(() => {
     redisService as any,
     productService as any,
     orderQueue as any,
+    purchasesTotal as any,
   );
 
   // Default happy-path stubs (overridden per test as needed)

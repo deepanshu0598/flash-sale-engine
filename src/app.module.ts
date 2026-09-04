@@ -1,7 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { PassportModule } from '@nestjs/passport';
+import { LoggerModule } from 'nestjs-pino';
 import { BullBoardModule } from '@bull-board/nestjs';
 import { ExpressAdapter } from '@bull-board/express';
 import { BullAdapter } from '@bull-board/api/bullAdapter';
@@ -18,6 +20,7 @@ import { FlashSaleModule } from './modules/flash-sale/flash-sale.module.js';
 import { OrderModule } from './modules/order/order.module.js';
 import { QueueModule } from './modules/queue/queue.module.js';
 import { HealthModule } from './modules/health/health.module.js';
+import { MetricsModule } from './modules/metrics/metrics.module.js';
 import { ORDER_QUEUE, ORDER_DLQ } from './modules/queue/queue.constants.js';
 
 @Module({
@@ -25,6 +28,29 @@ import { ORDER_QUEUE, ORDER_DLQ } from './modules/queue/queue.constants.js';
     ConfigModule.forRoot({
       isGlobal: true,
       load: [appConfig, databaseConfig, redisConfig],
+    }),
+    // Overrides Nest's default text logger app-wide (see main.ts's
+    // app.useLogger(app.get(Logger))) — every existing `new Logger(ctx)` call
+    // across the codebase routes through this and becomes structured JSON
+    // automatically, with zero changes needed in those files. pino-http also
+    // auto-logs every HTTP request/response with a reqId, method, url,
+    // statusCode, and responseTime — the request-level correlation the
+    // roadmap asked for, without request-scoping any provider (which would
+    // have meant re-creating FlashSaleService's whole DI subgraph on every
+    // purchase request — not acceptable on this hot path).
+    LoggerModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        pinoHttp: {
+          genReqId: (req: { headers: Record<string, string | string[] | undefined> }) =>
+            req.headers['x-request-id'] ?? randomUUID(),
+          redact: ['req.headers.authorization', 'req.headers.cookie'],
+          transport:
+            config.get<string>('app.nodeEnv') === 'production'
+              ? undefined
+              : { target: 'pino-pretty', options: { singleLine: true } },
+        },
+      }),
     }),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
@@ -54,6 +80,7 @@ import { ORDER_QUEUE, ORDER_DLQ } from './modules/queue/queue.constants.js';
     BullBoardModule.forFeature({ name: ORDER_DLQ, adapter: BullAdapter }),
     RedisModule,
     QueueModule,
+    MetricsModule,
     AuthModule,
     UserModule,
     ProductModule,

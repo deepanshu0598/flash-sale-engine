@@ -9,6 +9,8 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
+import { InjectMetric } from '@willsoto/nestjs-prometheus';
+import type { Counter } from 'prom-client';
 import { randomBytes } from 'node:crypto';
 import { FlashSale, SaleStatus } from './entities/flash-sale.entity.js';
 import { CreateSaleDto } from './dto/create-sale.dto.js';
@@ -17,6 +19,7 @@ import { RedisService } from '../redis/redis.service.js';
 import { ProductService } from '../product/product.service.js';
 import { Order, OrderStatus } from '../order/entities/order.entity.js';
 import { ORDER_QUEUE, PROCESS_ORDER_JOB } from '../queue/queue.constants.js';
+import { PURCHASES_TOTAL } from '../metrics/metrics.constants.js';
 
 @Injectable()
 export class FlashSaleService {
@@ -31,6 +34,8 @@ export class FlashSaleService {
     private readonly productService: ProductService,
     @InjectQueue(ORDER_QUEUE)
     private readonly orderQueue: any,
+    @InjectMetric(PURCHASES_TOTAL)
+    private readonly purchasesTotal: Counter<string>,
   ) {}
 
   private static readonly IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
@@ -57,7 +62,11 @@ export class FlashSaleService {
         const cached = await this.redis.getIdempotentResult<{ orderId: string; jobId: string }>(
           idempotencyRedisKey,
         );
-        if (cached) return cached;
+        if (cached) {
+          this.purchasesTotal.inc({ result: 'duplicate' });
+          return cached;
+        }
+        this.purchasesTotal.inc({ result: 'in_progress' });
         throw new ConflictException(
           'A request with this idempotency key is already in progress — retry shortly',
         );
@@ -73,13 +82,25 @@ export class FlashSaleService {
           FlashSaleService.IDEMPOTENCY_TTL_SECONDS,
         );
       }
+      this.purchasesTotal.inc({ result: 'success' });
       return result;
     } catch (error) {
       if (idempotencyRedisKey) {
         await this.redis.releaseIdempotencyKey(idempotencyRedisKey);
       }
+      this.purchasesTotal.inc({ result: this.classifyPurchaseFailure(error) });
       throw error;
     }
+  }
+
+  // Labels only what's cheap to distinguish by exception type — doPurchase()'s
+  // ConflictException is always the Lua "sold out" path here (the idempotency
+  // 409 above never reaches this catch, it throws before the try block).
+  private classifyPurchaseFailure(error: unknown): string {
+    if (error instanceof ConflictException) return 'sold_out';
+    if (error instanceof BadRequestException) return 'rejected'; // limit exceeded, sale not active/started/ended
+    if (error instanceof NotFoundException) return 'not_found';
+    return 'error';
   }
 
   private async doPurchase(
