@@ -316,6 +316,8 @@ BASE_URL=http://localhost:3000 SALE_ID=<sale-id> k6 run test/load/flash-sale.k6.
 | GET | `/metrics` | Prometheus scrape endpoint |
 | GET | `/api` | Swagger UI |
 
+**Postman collection:** [`postman/flash-sale-engine.postman_collection.json`](postman/flash-sale-engine.postman_collection.json) (+ [environment](postman/flash-sale-engine.postman_environment.json)) — every endpoint documented with parameters, headers, and response codes; Login auto-saves the JWT and Create Product/Sale auto-save their IDs, so the full register → login → create → purchase flow runs with zero manual copy-pasting. Import both files, select the "Flash Sale Engine - Local" environment, and go.
+
 ---
 
 ## Roadmap — Post-v1 Improvements

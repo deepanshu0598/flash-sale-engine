@@ -1,0 +1,364 @@
+{
+  "info": {
+    "name": "Flash Sale Engine",
+    "_postman_id": "f1a5b53e-0000-4000-8000-000000000001",
+    "description": "Lock-free flash sale engine — atomic Redis Lua purchases, NestJS, BullMQ, PostgreSQL. Handles 10K+ concurrent buyers with zero overselling.\n\n## How to use this collection\n1. Import this collection and the accompanying environment (`flash-sale-engine.postman_environment.json`).\n2. Select the **Flash Sale Engine - Local** environment in the top-right dropdown.\n3. Run **Auth → Register** once, then **Auth → Login**. Login automatically saves the returned `access_token` into the `{{accessToken}}` environment variable — every authenticated request below reuses it via Bearer auth, so you don't need to copy/paste tokens manually.\n4. Run **Products → Create Product**, then **Flash Sales → Create Flash Sale** (this auto-saves `{{productId}}` / `{{saleId}}` from the responses via a test script). Then hit **Flash Sales → Purchase from Sale**.\n5. Check **Orders** and **Flash Sales → Get Sale Status** to see the async confirmation land (BullMQ worker processes the reservation in the background — poll the order or the sale status endpoint).\n\n## Architecture notes relevant to testing\n- Purchases are **lock-free**: a single Redis Lua script atomically checks stock, decrements it, and enforces the per-user limit in one round trip. There is no distributed lock, so this is safe under heavy concurrency (verified with k6 at 10K virtual users, zero oversells).\n- `POST /flash-sales/:id/purchase` returns **201 immediately with `{ orderId, jobId }`** — the order starts as `pending` and a BullMQ worker confirms it asynchronously (simulates payment processing). Poll `GET /orders/:id` or `GET /flash-sales/:id/status` to watch it move to `confirmed` or `failed`.\n- Send the same `X-Idempotency-Key` header on a retried purchase request to safely get the original result back instead of double-purchasing (useful for testing client retry logic / flaky networks).\n- If a sale is created with `webhookUrl`, a `webhookSecret` is returned **once**, in the create response only. The app calls your webhook URL with an `X-Webhook-Signature` header (HMAC-SHA256 of the JSON body, using that secret) when an order is confirmed.\n- Rate limiting on purchase: 5 requests / 10s per user, 20 requests / 10s per IP. Hammer the purchase endpoint in a Postman Runner loop to see `429` responses.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{accessToken}}", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "description": "Registration and login. Login response's `access_token` is auto-captured into `{{accessToken}}` by the request's Tests script, so every other authenticated request in this collection picks it up automatically via the collection-level Bearer auth.",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Deepanshu Agarwal\",\n  \"email\": \"deepanshu@example.com\",\n  \"password\": \"SuperSecret123\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "register"]
+            },
+            "description": "Creates a new user with a bcrypt-hashed password.\n\n**Body parameters**\n| Field | Type | Rules | Required |\n|---|---|---|---|\n| `name` | string | max 100 chars | yes |\n| `email` | string | valid email, must be unique | yes |\n| `password` | string | min 8 chars | yes |\n\n**Responses**\n- `201 Created` — user created (password never returned)\n- `409 Conflict` — email already in use\n- `400 Bad Request` — DTO validation failed (bad email format, password too short, etc.)"
+          },
+          "response": []
+        },
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.access_token) {",
+                  "        pm.environment.set('accessToken', body.access_token);",
+                  "        console.log('Saved access_token to {{accessToken}}');",
+                  "    }",
+                  "}",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"deepanshu@example.com\",\n  \"password\": \"SuperSecret123\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
+            },
+            "description": "Authenticates a user and returns a JWT access token (7-day expiry by default, configurable via `JWT_EXPIRES_IN`).\n\n**Body parameters**\n| Field | Type | Rules | Required |\n|---|---|---|---|\n| `email` | string | valid email | yes |\n| `password` | string | — | yes |\n\n**Responses**\n- `200 OK` — `{ access_token: string }`. This request's Tests script auto-saves it to `{{accessToken}}`.\n- `401 Unauthorized` — invalid credentials\n\nAll subsequent authenticated requests in this collection use `{{accessToken}}` via Bearer auth — no manual copy-paste needed."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Products",
+      "description": "Product catalog. Products are what flash sales are created against — create a product first, then reference its `id` when creating a sale.",
+      "item": [
+        {
+          "name": "List Products",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/products",
+              "host": ["{{baseUrl}}"],
+              "path": ["products"]
+            },
+            "description": "Returns all products. Public endpoint, no auth required.\n\n**Responses**\n- `200 OK` — array of products"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Product by ID",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/products/{{productId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["products", "{{productId}}"]
+            },
+            "description": "Fetch a single product by its UUID.\n\n**Path parameters**\n| Param | Type | Description |\n|---|---|---|\n| `id` | UUID | Product ID (auto-filled from `{{productId}}`, set by Create Product) |\n\n**Responses**\n- `200 OK` — product found\n- `404 Not Found` — no product with that id"
+          },
+          "response": []
+        },
+        {
+          "name": "Create Product",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.id) {",
+                  "        pm.environment.set('productId', body.id);",
+                  "        console.log('Saved product id to {{productId}}: ' + body.id);",
+                  "    }",
+                  "}",
+                  "pm.test('Status is 201', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Wireless Noise-Cancelling Headphones\",\n  \"originalPrice\": 199.99,\n  \"description\": \"Over-ear Bluetooth headphones with active noise cancellation and 30-hour battery life.\",\n  \"imageUrl\": \"https://example.com/images/headphones.jpg\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/products",
+              "host": ["{{baseUrl}}"],
+              "path": ["products"]
+            },
+            "description": "Creates a product in the catalog. No auth currently enforced on this endpoint (admin-only in a future iteration).\n\n**Body parameters**\n| Field | Type | Rules | Required |\n|---|---|---|---|\n| `name` | string | max 200 chars | yes |\n| `originalPrice` | number | >= 0, max 2 decimal places | yes |\n| `description` | string | free text | no |\n| `imageUrl` | string | valid URL | no |\n\n**Responses**\n- `201 Created` — product created. This request's Tests script auto-saves the returned `id` to `{{productId}}`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Flash Sales",
+      "description": "Core flash-sale endpoints, including the lock-free atomic purchase flow. `Get Sale Status` and stock counts read live from Redis (not the DB) so they reflect concurrent purchases in real time.",
+      "item": [
+        {
+          "name": "List Flash Sales",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/flash-sales",
+              "host": ["{{baseUrl}}"],
+              "path": ["flash-sales"]
+            },
+            "description": "Returns all flash sales, each enriched with live remaining stock read from Redis. `webhookSecret` is stripped from every response — it is only ever returned once, at creation time.\n\n**Responses**\n- `200 OK` — array of sales"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Flash Sale by ID",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/flash-sales/{{saleId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["flash-sales", "{{saleId}}"]
+            },
+            "description": "Fetch a single flash sale with live stock.\n\n**Path parameters**\n| Param | Type | Description |\n|---|---|---|\n| `id` | UUID | Sale ID (auto-filled from `{{saleId}}`, set by Create Flash Sale) |\n\n**Responses**\n- `200 OK` — sale found\n- `404 Not Found` — no sale with that id"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Sale Status (live)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/flash-sales/{{saleId}}/status",
+              "host": ["{{baseUrl}}"],
+              "path": ["flash-sales", "{{saleId}}", "status"]
+            },
+            "description": "Lightweight live-status endpoint — reads remaining stock, sold count, and time-remaining directly from Redis with **no database hit at all**. This is the endpoint a countdown/stock-ticker UI should poll frequently, since it's cheap.\n\n**Path parameters**\n| Param | Type | Description |\n|---|---|---|\n| `id` | UUID | Sale ID |\n\n**Responses**\n- `200 OK` — `{ remainingStock, sold, totalStock, startTime, endTime, isActive, ... }`\n- `404 Not Found` — no sale with that id"
+          },
+          "response": []
+        },
+        {
+          "name": "Create Flash Sale",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.id) {",
+                  "        pm.environment.set('saleId', body.id);",
+                  "        console.log('Saved sale id to {{saleId}}: ' + body.id);",
+                  "    }",
+                  "    if (body.webhookSecret) {",
+                  "        pm.environment.set('webhookSecret', body.webhookSecret);",
+                  "        console.log('Saved webhookSecret (shown only once) to {{webhookSecret}}');",
+                  "    }",
+                  "}",
+                  "pm.test('Status is 201', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"productId\": \"{{productId}}\",\n  \"salePrice\": 99.99,\n  \"totalStock\": 50,\n  \"startTime\": \"2026-09-04T00:00:00.000Z\",\n  \"endTime\": \"2026-09-11T00:00:00.000Z\",\n  \"maxPerUser\": 2,\n  \"webhookUrl\": \"https://webhook.site/your-unique-id\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/flash-sales",
+              "host": ["{{baseUrl}}"],
+              "path": ["flash-sales"]
+            },
+            "description": "Creates a flash sale and initializes its stock counter in Redis (the source of truth for available inventory during the sale — the Postgres row is the durable record).\n\n**Body parameters**\n| Field | Type | Rules | Required |\n|---|---|---|---|\n| `productId` | UUID | must reference an existing product | yes |\n| `salePrice` | number | >= 0, max 2 decimal places | yes |\n| `totalStock` | integer | >= 1 | yes |\n| `startTime` | ISO 8601 date string | — | yes |\n| `endTime` | ISO 8601 date string | must be after `startTime` | yes |\n| `maxPerUser` | integer | >= 1, per-user purchase cap enforced atomically in the same Lua script as the stock decrement | no |\n| `webhookUrl` | string (URL) | if set, order-confirmed events are POSTed here | no |\n\n**Responses**\n- `201 Created` — sale created. If `webhookUrl` was provided, the response includes a **`webhookSecret` shown exactly once** — save it immediately, it's used to verify the `X-Webhook-Signature` HMAC header on incoming webhook calls and is never returned again by any other endpoint. This request's Tests script auto-saves `id` → `{{saleId}}` and `webhookSecret` → `{{webhookSecret}}` for convenience while testing.\n- `400 Bad Request` — `endTime` not after `startTime`, or DTO validation failed"
+          },
+          "response": []
+        },
+        {
+          "name": "Purchase from Sale",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{$guid}}",
+                "description": "Optional. Send the SAME value on a retried request (e.g. after a network timeout) to safely get back the original result instead of purchasing twice. Defaults here to a fresh Postman-generated GUID each run."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/flash-sales/{{saleId}}/purchase",
+              "host": ["{{baseUrl}}"],
+              "path": ["flash-sales", "{{saleId}}", "purchase"]
+            },
+            "description": "**The core endpoint of this project.** Attempts to purchase from a flash sale using a single atomic Redis Lua script — no distributed locks, safe under massive concurrency (load-tested at 10K virtual users with zero oversells).\n\nRequires a Bearer JWT (from Login). The purchase is accepted synchronously but **confirmed asynchronously** by a BullMQ worker (simulating a payment gateway call) — the response only tells you the reservation succeeded, not that payment is final.\n\n**Path parameters**\n| Param | Type | Description |\n|---|---|---|\n| `id` | UUID | Flash sale ID |\n\n**Headers**\n| Header | Required | Description |\n|---|---|---|\n| `Authorization` | yes | `Bearer <access_token>` (auto-filled from `{{accessToken}}`) |\n| `X-Idempotency-Key` | no | Dedup key for safe client-side retries |\n\n**Body parameters**\n| Field | Type | Rules | Required |\n|---|---|---|---|\n| `quantity` | integer | >= 1, default 1 | no |\n\n**What happens step by step**\n1. `PurchaseRateLimitGuard` checks Redis fixed-window counters (5 req/10s per user, 20 req/10s per IP) — rejects with 429 if exceeded, before touching inventory.\n2. `JwtAuthGuard` validates the Bearer token and attaches `req.user`.\n3. If an `X-Idempotency-Key` was sent and already claimed, the original stored result is returned immediately (no double purchase).\n4. The atomic Lua script checks: sale is active (between `startTime`/`endTime`), stock remaining, and the user's existing purchase count against `maxPerUser` — all in one Redis round trip — then decrements stock and returns success/failure.\n5. On success, an `order` row is created (`status: pending`) and a job is pushed onto the BullMQ order queue for async confirmation.\n\n**Responses**\n- `201 Created` — `{ orderId, jobId }`. Poll `GET /orders/:orderId` or `GET /flash-sales/:id/status` to watch it resolve to `confirmed`/`failed`.\n- `400 Bad Request` — sale not started yet / already ended, or `maxPerUser` limit exceeded\n- `409 Conflict` — sold out, or a request with this idempotency key is already being processed concurrently\n- `429 Too Many Requests` — rate limit exceeded"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "description": "Read-only order tracking for the authenticated user. Orders start `pending`, then a BullMQ worker moves them to `confirmed` or `failed` (with `failureReason` set) asynchronously after a purchase.",
+      "item": [
+        {
+          "name": "List My Orders",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orders",
+              "host": ["{{baseUrl}}"],
+              "path": ["orders"]
+            },
+            "description": "Lists every order belonging to the authenticated user (scoped by JWT `sub`), most recent first.\n\n**Responses**\n- `200 OK` — array of orders, each with `status` (`pending` | `processing` | `confirmed` | `failed`), `jobId`, `failureReason`"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Order by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orders/{{orderId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["orders", "{{orderId}}"]
+            },
+            "description": "Fetch a single order. Ownership is enforced — you can only fetch your own orders.\n\n**Path parameters**\n| Param | Type | Description |\n|---|---|---|\n| `id` | UUID | Order ID — copy this from the `orderId` returned by Purchase from Sale, or set `{{orderId}}` manually |\n\n**Responses**\n- `200 OK` — order found\n- `404 Not Found` — no order with that id\n- `403 Forbidden` — order exists but belongs to a different user"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Health & Ops",
+      "description": "Infrastructure-facing endpoints — not part of the business API surface, but useful to confirm the stack is up before running the rest of the collection.",
+      "item": [
+        {
+          "name": "App Root",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/",
+              "host": ["{{baseUrl}}"],
+              "path": [""]
+            },
+            "description": "Trivial root route — returns a plain 'Hello World'-style string. Useful as a fast smoke test that the app process is up at all.\n\n**Responses**\n- `200 OK` — plain text greeting"
+          },
+          "response": []
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "NestJS Terminus health check — currently pings the PostgreSQL connection. Used by Docker healthchecks / orchestrators to decide if the container is ready to receive traffic.\n\n**Responses**\n- `200 OK` — `{ status: 'ok', info: { database: { status: 'up' } }, ... }`\n- `503 Service Unavailable` — database ping failed"
+          },
+          "response": []
+        },
+        {
+          "name": "Prometheus Metrics",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/metrics",
+              "host": ["{{baseUrl}}"],
+              "path": ["metrics"]
+            },
+            "description": "Prometheus exposition-format text output — request counts/latencies (labeled by route, not raw URL, to avoid cardinality explosion), purchase outcome counters, Redis pool gauges, default Node.js process metrics. Scraped by the `prometheus` service in docker-compose; visualized in the bundled Grafana dashboard.\n\n**Responses**\n- `200 OK` — `text/plain; version=0.0.4` Prometheus exposition format"
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
