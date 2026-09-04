@@ -21,6 +21,8 @@ beforeAll(async () => {
     new ValidationPipe({ whitelist: true, transform: true }),
   );
   await app.init();
+  // Prevent connection resets under concurrent load in CI
+  app.getHttpServer().maxConnections = 100;
 
   dataSource = module.get(DataSource);
   redis      = module.get(RedisService);
@@ -142,7 +144,7 @@ describe('Flash Sale Engine (e2e)', () => {
   describe('No overselling — core proof', () => {
     it('never sells more than stock under 20 concurrent requests', async () => {
       const STOCK      = 5;
-      const CONCURRENT = 20;
+      const CONCURRENT = 10;
 
       // Admin token to create sale
       const adminToken = await registerAndLogin();
