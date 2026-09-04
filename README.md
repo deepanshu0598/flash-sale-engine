@@ -311,6 +311,63 @@ BASE_URL=http://localhost:3000 SALE_ID=<sale-id> k6 run test/load/flash-sale.k6.
 
 ---
 
+## Roadmap — Post-v1 Improvements
+
+Core engine is verified at 1,000 concurrent users (0% errors, zero oversell). The items below are
+tech debt and nice-to-have features, ordered by phase. Full detail (files touched, implementation
+approach) lives in the published roadmap artifact; this table is the at-a-glance summary.
+
+**19 items · ~30h total · 8 high priority · 2 deploy blockers**
+
+### Phase 0 — Tech Debt (do first)
+
+Two items here block a clean production deploy — a fresh database currently has no committed
+schema-creation path.
+
+| Item | Priority | Effort |
+|---|---|---|
+| Generate initial DB migration (`src/database/migrations/` is empty; CI's `migration:run` is a silent no-op) | **Blocker** | ~1h |
+| Add FK relations + indexes on `orders` (currently plain UUID columns, no FKs, no indexes on `userId`/`flashSaleId`) | **Blocker** | ~1.5h |
+| Dependency cleanup: both `bull` and `bullmq` installed, only `@nestjs/bull` used | Low | ~30m |
+| Fix replica scaling docs (`deploy: replicas: 4` is a no-op under plain `docker compose up`) | Low | ~15m |
+
+### Phase 1 — Quick Wins (~4.5h)
+
+| Item | Priority | Effort |
+|---|---|---|
+| Rate limiting on `/purchase` (Redis sliding window, per-user + per-IP) | High | ~2h |
+| Sale init guard (auto-rebuild `inventory:{saleId}` from DB if the Redis key is lost) | High | ~1h |
+| Graceful shutdown (drain in-flight requests + jobs on SIGTERM) | Medium | ~1h |
+| Redis key TTL alert (warn before `inventory:{saleId}` expires unexpectedly) | Medium | ~30m |
+
+### Phase 2 — Reliability (~11h)
+
+| Item | Priority | Effort |
+|---|---|---|
+| Idempotency key on purchase (`X-Idempotency-Key` — prevents double-buys on client retry) | High | ~3h |
+| Redis↔DB reconciliation job (repairs stock drift and stranded PENDING orders from crash scenarios) | High | ~2h |
+| Dead Letter Queue (failed jobs after 3 retries move to DLQ instead of vanishing) | High | ~2h |
+| Sale status endpoint (`GET /flash-sales/:id/status` — pure Redis, no DB hit) | Medium | ~1h |
+| Order webhook (POST callback on order CONFIRMED, HMAC-signed) | Medium | ~3h |
+
+### Phase 3 — Observability (~7h)
+
+| Item | Priority | Effort |
+|---|---|---|
+| Prometheus + Grafana dashboard (req/s, p99, queue depth, pool health) | High | ~4h |
+| Structured JSON logging via Pino (requestId/userId/saleId per log line) | Medium | ~2h |
+| OpenAPI response schemas on every endpoint | Low | ~1h |
+
+### Phase 4 — Validation (~4h)
+
+| Item | Priority | Effort |
+|---|---|---|
+| 10K VU test on a tuned Linux cloud VM (Windows TCP backlog blocks this locally) | Medium | ~2h |
+| GitHub PR-based workflow (branch protection, require CI pass) | Low | ~30m |
+| k6 Cloud / distributed load test (multi-agent, no script changes needed) | Low | ~1.5h |
+
+---
+
 ## Tech Stack
 
 | Layer | Technology |
