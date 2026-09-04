@@ -5,6 +5,7 @@
 > Built with NestJS, Redis, BullMQ, and PostgreSQL.
 
 [![CI](https://github.com/deepanshu0598/flash-sale-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/deepanshu0598/flash-sale-engine/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 

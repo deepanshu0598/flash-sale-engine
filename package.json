@@ -1,10 +1,10 @@
 {
   "name": "flash-sale-engine",
   "version": "0.0.1",
-  "description": "",
-  "author": "",
+  "description": "Lock-free flash sale engine — atomic Redis Lua purchases, NestJS, BullMQ, PostgreSQL. 10K+ concurrent buyers, zero overselling.",
+  "author": "Deepanshu Agarwal",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "nest build",
