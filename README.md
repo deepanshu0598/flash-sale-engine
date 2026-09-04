@@ -126,12 +126,18 @@ Lock-free Lua + Redis pool (5 conn) + DB pool (50 conn). Single NestJS instance.
 
 ### Before vs After
 
-| Metric | v1.0 (distributed lock) | Current (lock-free) | Improvement |
-|--------|------------------------|---------------------|-------------|
-| successful_purchases | 254 | **281** | All stock sold |
+| Metric | v1.0 (distributed lock) | Current (lock-free + pool) | Improvement |
+|--------|------------------------|---------------------------|-------------|
 | p(95) response time | 3.41s | **159ms** | **21× faster** |
+| avg response time | ~520ms | **62ms** | **8× faster** |
 | throughput | 292 req/s | **387 req/s** | +32% |
-| error rate | 0.00% | **0.00%** | same |
+| successful_purchases | 254 | **281** | 100% stock sold |
+| oversell incidents | 0 | **0** | maintained |
+| error rate (5xx) | 0.00% | **0.00%** | maintained |
+| concurrent VUs tested | 1,000 | **1,000** | same load |
+| DB connections (pool) | 10 | **50** | 5× headroom |
+| Redis connections | 1 | **5 (pool)** | fault-tolerant |
+| lock serialization | yes — 1 req at a time | **none** | removed |
 
 ### 10K VUs — requires Linux + tuned kernel
 
