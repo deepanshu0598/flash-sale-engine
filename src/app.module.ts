@@ -37,6 +37,11 @@ import { ORDER_QUEUE } from './modules/queue/queue.constants.js';
         database: config.get<string>('database.name'),
         autoLoadEntities: true,
         synchronize: true,
+        extra: {
+          max: 50,  // pg pool size: handles burst of concurrent INSERTs (default 10)
+          idleTimeoutMillis: 30_000,
+          connectionTimeoutMillis: 5_000,
+        },
       }),
     }),
     PassportModule.register({ defaultStrategy: 'jwt' }),
