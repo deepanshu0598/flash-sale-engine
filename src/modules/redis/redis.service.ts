@@ -8,64 +8,63 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+const POOL_SIZE = 5;
+
 @Injectable()
 export class RedisService implements OnModuleInit, OnModuleDestroy {
-  private client: Redis;
+  private _pool: Redis[] = [];
+  private _poolIndex = 0;
   private readonly logger = new Logger(RedisService.name);
+
+  // Round-robin across pool — all existing this.client usages work unchanged
+  private get client(): Redis {
+    return this._pool[this._poolIndex++ % this._pool.length];
+  }
 
   constructor(private readonly config: ConfigService) {}
 
   async onModuleInit() {
-    this.client = new Redis({
+    const options = {
       host: this.config.get<string>('redis.host'),
       port: this.config.get<number>('redis.port'),
       retryStrategy: (times: number) => Math.min(times * 50, 2000),
       connectTimeout: 10_000,
       maxRetriesPerRequest: 3,
       enableOfflineQueue: true,
-    });
+    };
 
-    this.client.on('connect', () => this.logger.log('Redis connected'));
-    this.client.on('error', (err: Error) => this.logger.error('Redis error', err));
-
-    this.loadLuaScripts();
+    for (let i = 0; i < POOL_SIZE; i++) {
+      const conn = new Redis(options);
+      conn.on('connect', () => this.logger.log(`Redis [${i}] connected`));
+      conn.on('error', (err: Error) => this.logger.error(`Redis [${i}] error`, err));
+      this.loadLuaScriptsOn(conn);
+      this._pool.push(conn);
+    }
   }
 
   async onModuleDestroy() {
-    await this.client.quit();
+    await Promise.all(this._pool.map((c) => c.quit()));
   }
 
-  private loadLuaScripts(): void {
+  private loadLuaScriptsOn(conn: Redis): void {
     const scriptsDir = join(__dirname, 'scripts');
 
-    const deductScript = readFileSync(
-      join(scriptsDir, 'deduct-inventory.lua'),
-      'utf8',
-    );
-    this.client.defineCommand('deductInventory', {
+    conn.defineCommand('deductInventory', {
       numberOfKeys: 2,
-      lua: deductScript,
+      lua: readFileSync(join(scriptsDir, 'deduct-inventory.lua'), 'utf8'),
     });
 
-    const releaseScript = readFileSync(
-      join(scriptsDir, 'release-lock.lua'),
-      'utf8',
-    );
-    this.client.defineCommand('releaseLock', {
+    conn.defineCommand('releaseLock', {
       numberOfKeys: 1,
-      lua: releaseScript,
+      lua: readFileSync(join(scriptsDir, 'release-lock.lua'), 'utf8'),
     });
 
-    const atomicScript = readFileSync(
-      join(scriptsDir, 'purchase-atomic.lua'),
-      'utf8',
-    );
-    this.client.defineCommand('atomicPurchase', {
+    conn.defineCommand('atomicPurchase', {
       numberOfKeys: 3,
-      lua: atomicScript,
+      lua: readFileSync(join(scriptsDir, 'purchase-atomic.lua'), 'utf8'),
     });
 
-    this.logger.log('Lua scripts loaded');
+    this.logger.log(`Lua scripts loaded on connection`);
   }
 
   // ─── Distributed Lock ─────────────────────────────────────────────────────
@@ -140,6 +139,6 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   getClient(): Redis {
-    return this.client;
+    return this._pool[0];
   }
 }
