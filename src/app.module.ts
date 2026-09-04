@@ -18,7 +18,7 @@ import { FlashSaleModule } from './modules/flash-sale/flash-sale.module.js';
 import { OrderModule } from './modules/order/order.module.js';
 import { QueueModule } from './modules/queue/queue.module.js';
 import { HealthModule } from './modules/health/health.module.js';
-import { ORDER_QUEUE } from './modules/queue/queue.constants.js';
+import { ORDER_QUEUE, ORDER_DLQ } from './modules/queue/queue.constants.js';
 
 @Module({
   imports: [
@@ -51,6 +51,7 @@ import { ORDER_QUEUE } from './modules/queue/queue.constants.js';
     PassportModule.register({ defaultStrategy: 'jwt' }),
     BullBoardModule.forRoot({ route: '/queues', adapter: ExpressAdapter }),
     BullBoardModule.forFeature({ name: ORDER_QUEUE, adapter: BullAdapter }),
+    BullBoardModule.forFeature({ name: ORDER_DLQ, adapter: BullAdapter }),
     RedisModule,
     QueueModule,
     AuthModule,

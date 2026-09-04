@@ -6,6 +6,7 @@ import {
   Param,
   UseGuards,
   Req,
+  Headers,
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { FlashSaleService } from './flash-sale.service.js';
@@ -28,6 +29,11 @@ export class FlashSaleController {
     return this.flashSaleService.findOne(id);
   }
 
+  @Get(':id/status')
+  status(@Param('id') id: string) {
+    return this.flashSaleService.getStatus(id);
+  }
+
   @Post()
   create(@Body() dto: CreateSaleDto) {
     return this.flashSaleService.create(dto);
@@ -35,8 +41,13 @@ export class FlashSaleController {
 
   @Post(':id/purchase')
   @UseGuards(JwtAuthGuard, PurchaseRateLimitGuard)
-  purchase(@Param('id') id: string, @Body() dto: PurchaseDto, @Req() req: Request) {
+  purchase(
+    @Param('id') id: string,
+    @Body() dto: PurchaseDto,
+    @Req() req: Request,
+    @Headers('x-idempotency-key') idempotencyKey?: string,
+  ) {
     const user = req.user as { id: string };
-    return this.flashSaleService.purchase(user.id, id, dto);
+    return this.flashSaleService.purchase(user.id, id, dto, idempotencyKey);
   }
 }

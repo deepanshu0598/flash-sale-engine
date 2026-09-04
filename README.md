@@ -304,8 +304,9 @@ BASE_URL=http://localhost:3000 SALE_ID=<sale-id> k6 run test/load/flash-sale.k6.
 | GET | `/products` | List all products |
 | POST | `/products` | Create a product |
 | GET | `/flash-sales` | List sales with live Redis stock |
-| POST | `/flash-sales` | Create a flash sale |
-| POST | `/flash-sales/:id/purchase` | Purchase (the core endpoint) |
+| POST | `/flash-sales` | Create a flash sale (optional `webhookUrl` — returns a one-time `webhookSecret`) |
+| GET | `/flash-sales/:id/status` | Live stock + sold + time remaining, no DB hit |
+| POST | `/flash-sales/:id/purchase` | Purchase (the core endpoint). Optional `X-Idempotency-Key` header |
 | GET | `/orders/:id` | Track order status |
 | GET | `/health` | Health check |
 | GET | `/queues` | Bull Board job monitor |
@@ -343,15 +344,15 @@ schema-creation path. All four are now done.
 | ✓ Graceful shutdown — `app.enableShutdownHooks()` + a `QueueShutdownService` (`@nestjs/bull` doesn't drain queues on its own); verified with a real `docker stop` against the built image | Medium | ~1h |
 | ✓ Redis key TTL alert — merged into the init guard as a reactive warn log, since `inventory:{saleId}` is set with no TTL by design (see code comment for why a literal "TTL < 60s" check doesn't apply here) | Medium | ~30m |
 
-### Phase 2 — Reliability (~11h)
+### Phase 2 — Reliability ✓ shipped
 
 | Item | Priority | Effort |
 |---|---|---|
-| Idempotency key on purchase (`X-Idempotency-Key` — prevents double-buys on client retry) | High | ~3h |
-| Redis↔DB reconciliation job (repairs stock drift and stranded PENDING orders from crash scenarios) | High | ~2h |
-| Dead Letter Queue (failed jobs after 3 retries move to DLQ instead of vanishing) | High | ~2h |
-| Sale status endpoint (`GET /flash-sales/:id/status` — pure Redis, no DB hit) | Medium | ~1h |
-| Order webhook (POST callback on order CONFIRMED, HMAC-signed) | Medium | ~3h |
+| ✓ Idempotency key — `X-Idempotency-Key` header, Redis claim-then-store (24h TTL), duplicate retries get the original response; failed attempts release the claim so the same key can retry | High | ~3h |
+| ✓ Redis↔DB reconciliation job — runs every 5 min: restocks Redis's sold count when it exceeds the DB's non-FAILED reserved quantity (the real cause: failed payments never returned their reserved unit), and re-enqueues PENDING orders with no `jobId` after 10 min (crash between DB insert and queue enqueue) | High | ~2h |
+| ✓ Dead Letter Queue — a second Bull queue (`order-dlq`); `OrderProcessor` routes a job there on its final exhausted attempt, visible in Bull Board alongside the main queue | High | ~2h |
+| ✓ Sale status endpoint — `GET /flash-sales/:id/status`, live stock + sold + time remaining, sale metadata from the existing cache (no DB hit on the hot path) | Medium | ~1h |
+| ✓ Order webhook — optional `webhookUrl` on sale creation, server-generates a one-time-revealed `webhookSecret`, HMAC-SHA256-signed POST fired on order CONFIRMED via native `fetch` (no new HTTP client dependency); delivery failure is logged and never affects the order itself | Medium | ~3h |
 
 ### Phase 3 — Observability (~7h)
 

@@ -1,4 +1,4 @@
-import { IsUUID, IsNumber, IsInt, IsDateString, IsOptional, Min } from 'class-validator';
+import { IsUUID, IsNumber, IsInt, IsDateString, IsOptional, IsUrl, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 export class CreateSaleDto {
@@ -26,4 +26,11 @@ export class CreateSaleDto {
   @IsOptional()
   @Type(() => Number)
   maxPerUser?: number;
+
+  // If set, a webhookSecret is generated server-side and returned once in
+  // the create() response — the caller uses it to verify the HMAC signature
+  // on incoming order-confirmed callbacks (see order.processor.ts).
+  @IsUrl({ require_tld: false })
+  @IsOptional()
+  webhookUrl?: string;
 }

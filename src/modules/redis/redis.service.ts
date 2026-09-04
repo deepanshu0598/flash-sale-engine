@@ -128,6 +128,18 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return val !== null ? parseInt(val, 10) : null;
   }
 
+  // Gives units back to inventory when the reconciliation job finds Redis's
+  // sold count ahead of what the DB actually has reserved (e.g. failed-payment
+  // orders that never returned their unit). Not wrapped in a Lua script — this
+  // runs from a single periodic job, not from concurrent purchase() calls, so
+  // there's no contention to make atomic here; a live purchase decrementing
+  // inventory at the same moment just interleaves normally with these two
+  // commands, which is fine for a corrective background pass.
+  async restockInventory(saleId: string, qty: number): Promise<void> {
+    await this.client.incrby(`inventory:${saleId}`, qty);
+    await this.client.decrby(`sold:${saleId}`, qty);
+  }
+
   // NX-based reinit for the Sale Init Guard: only sets keys that are actually
   // missing, so concurrent requests racing to self-heal the same sale don't
   // stomp each other's writes (unlike initInventory(), which is an unconditional
@@ -158,6 +170,35 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
   getClient(): Redis {
     return this._pool[0];
+  }
+
+  // ─── Idempotency (purchase dedup on client retry) ──────────────────────────
+  // Two-phase: claim the key first (NX — only one concurrent request can win
+  // it), do the work, then overwrite the claim with the real result. A
+  // concurrent duplicate that loses the claim either gets the cached result
+  // (if the first request already finished) or a 409 telling it to retry
+  // shortly (if the first request is still mid-flight) — it never re-runs
+  // the purchase.
+  async claimIdempotencyKey(key: string, ttlSeconds: number): Promise<boolean> {
+    const result = await this.client.set(key, 'PENDING', 'EX', ttlSeconds, 'NX');
+    return result === 'OK';
+  }
+
+  async getIdempotentResult<T>(key: string): Promise<T | null> {
+    const val = await this.client.get(key);
+    if (!val || val === 'PENDING') return null;
+    return JSON.parse(val) as T;
+  }
+
+  async storeIdempotentResult<T>(key: string, value: T, ttlSeconds: number): Promise<void> {
+    await this.client.set(key, JSON.stringify(value), 'EX', ttlSeconds);
+  }
+
+  // Releases a claimed-but-failed key so the same idempotency key can be
+  // retried — only successful purchases should be memoized forever; a
+  // sold-out or validation failure shouldn't permanently lock the key.
+  async releaseIdempotencyKey(key: string): Promise<void> {
+    await this.client.del(key);
   }
 
   // ─── Rate Limiting (fixed window) ──────────────────────────────────────────

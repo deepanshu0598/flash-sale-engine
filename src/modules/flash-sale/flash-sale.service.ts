@@ -9,6 +9,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
+import { randomBytes } from 'node:crypto';
 import { FlashSale, SaleStatus } from './entities/flash-sale.entity.js';
 import { CreateSaleDto } from './dto/create-sale.dto.js';
 import { PurchaseDto } from './dto/purchase.dto.js';
@@ -32,7 +33,56 @@ export class FlashSaleService {
     private readonly orderQueue: any,
   ) {}
 
+  private static readonly IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
+
   async purchase(
+    userId: string,
+    saleId: string,
+    dto: PurchaseDto,
+    idempotencyKey?: string,
+  ): Promise<{ orderId: string; jobId: string }> {
+    // ── Idempotency claim ───────────────────────────────────────
+    // Scoped per-user so two different users can't collide on the same key.
+    // Only claimed BEFORE any Redis/DB side effects — a claim that never
+    // gets released on failure (see catch below) would permanently block
+    // retries under that key, which is worse than the duplicate it prevents.
+    let idempotencyRedisKey: string | null = null;
+    if (idempotencyKey) {
+      idempotencyRedisKey = `idempotency:${userId}:${idempotencyKey}`;
+      const claimed = await this.redis.claimIdempotencyKey(
+        idempotencyRedisKey,
+        FlashSaleService.IDEMPOTENCY_TTL_SECONDS,
+      );
+      if (!claimed) {
+        const cached = await this.redis.getIdempotentResult<{ orderId: string; jobId: string }>(
+          idempotencyRedisKey,
+        );
+        if (cached) return cached;
+        throw new ConflictException(
+          'A request with this idempotency key is already in progress — retry shortly',
+        );
+      }
+    }
+
+    try {
+      const result = await this.doPurchase(userId, saleId, dto);
+      if (idempotencyRedisKey) {
+        await this.redis.storeIdempotentResult(
+          idempotencyRedisKey,
+          result,
+          FlashSaleService.IDEMPOTENCY_TTL_SECONDS,
+        );
+      }
+      return result;
+    } catch (error) {
+      if (idempotencyRedisKey) {
+        await this.redis.releaseIdempotencyKey(idempotencyRedisKey);
+      }
+      throw error;
+    }
+  }
+
+  private async doPurchase(
     userId: string,
     saleId: string,
     dto: PurchaseDto,
@@ -173,6 +223,10 @@ export class FlashSaleService {
       throw new BadRequestException('endTime must be after startTime');
     }
 
+    // Generated here, not accepted from the client — a caller-supplied secret
+    // would let anyone forge a signature without ever seeing a real callback.
+    const webhookSecret = dto.webhookUrl ? randomBytes(32).toString('hex') : null;
+
     const sale = this.saleRepo.create({
       productId:  dto.productId,
       salePrice:  dto.salePrice,
@@ -181,12 +235,22 @@ export class FlashSaleService {
       endTime,
       maxPerUser: dto.maxPerUser ?? 1,
       status:     SaleStatus.ACTIVE,
+      webhookUrl: dto.webhookUrl ?? null,
+      webhookSecret,
     });
 
     const saved = await this.saleRepo.save(sale);
     await this.redis.initInventory(saved.id, saved.totalStock);
+    // Cache stores the secret too (purchase()'s cache-aside reads it back for
+    // status endpoints etc.) — it's an internal Redis key, never serialized
+    // into an HTTP response; see stripWebhookSecret() for the actual boundary.
     await this.redis.setSaleCache(saved.id, saved, 3600);
-    return saved;
+    return saved; // one-time reveal of webhookSecret — every other read path strips it
+  }
+
+  private stripWebhookSecret(sale: FlashSale): Omit<FlashSale, 'webhookSecret'> {
+    const { webhookSecret: _webhookSecret, ...rest } = sale;
+    return rest;
   }
 
   async findAll(): Promise<object[]> {
@@ -197,7 +261,7 @@ export class FlashSaleService {
 
     return Promise.all(
       sales.map(async (sale) => ({
-        ...sale,
+        ...this.stripWebhookSecret(sale),
         liveStock: await this.redis.getInventory(sale.id),
         liveSold:  await this.redis.getSoldCount(sale.id),
       })),
@@ -214,12 +278,43 @@ export class FlashSaleService {
     const liveStock = await this.redis.getInventory(id);
     const liveSold  = await this.redis.getSoldCount(id);
 
-    return { ...sale, liveStock, liveSold };
+    return { ...this.stripWebhookSecret(sale), liveStock, liveSold };
   }
 
   async findOneEntity(id: string): Promise<FlashSale> {
     const sale = await this.saleRepo.findOne({ where: { id } });
     if (!sale) throw new NotFoundException('Flash sale not found');
     return sale;
+  }
+
+  // Pure-Redis status read for real-time countdown UIs — no PostgreSQL query
+  // on the hot path. endTime comes from the same sale cache purchase() already
+  // maintains (cache-aside), so this stays fast even on cache misses (one
+  // DB read, then cached) without adding a second data source to keep in sync.
+  async getStatus(saleId: string): Promise<{
+    saleId: string;
+    liveStock: number;
+    liveSold: number;
+    timeRemainingSeconds: number | null;
+  }> {
+    let sale = await this.redis.getSaleFromCache<FlashSale>(saleId);
+    if (!sale) {
+      const found = await this.saleRepo.findOne({ where: { id: saleId } });
+      if (!found) throw new NotFoundException('Flash sale not found');
+      await this.redis.setSaleCache(saleId, found, 60);
+      sale = found;
+    }
+
+    const [liveStock, liveSold] = await Promise.all([
+      this.redis.getInventory(saleId),
+      this.redis.getSoldCount(saleId),
+    ]);
+
+    const timeRemainingSeconds = Math.max(
+      Math.ceil((new Date(sale.endTime).getTime() - Date.now()) / 1000),
+      0,
+    );
+
+    return { saleId, liveStock, liveSold, timeRemainingSeconds };
   }
 }

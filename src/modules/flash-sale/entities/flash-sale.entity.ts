@@ -48,6 +48,16 @@ export class FlashSale {
   @Column({ default: 1 })
   maxPerUser: number;
 
+  // Caller-configured callback fired on order CONFIRMED (see order.processor.ts).
+  // webhookSecret is generated server-side at sale creation and returned once
+  // in the create() response — it must be stripped from every other read path
+  // (findAll/findOne/getStatus) so it's never re-exposed after that.
+  @Column({ type: 'varchar', nullable: true })
+  webhookUrl: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  webhookSecret: string | null;
+
   @CreateDateColumn()
   createdAt: Date;
 }

@@ -29,6 +29,11 @@ const redisService = {
   getSaleFromCache:           vi.fn(),
   setSaleCache:               vi.fn(),
   atomicPurchase:             vi.fn(),
+  getSoldCount:                vi.fn(),
+  claimIdempotencyKey:         vi.fn(),
+  getIdempotentResult:         vi.fn(),
+  storeIdempotentResult:       vi.fn(),
+  releaseIdempotencyKey:       vi.fn(),
 };
 
 const productService = { findOne: vi.fn() };
@@ -80,6 +85,11 @@ beforeEach(() => {
   orderRepo.save.mockResolvedValue({ id: 'order-uuid' });
   orderRepo.update.mockResolvedValue(undefined);
   orderQueue.add.mockResolvedValue({ id: 'job-1' });
+  redisService.getSoldCount.mockResolvedValue(0);
+  redisService.claimIdempotencyKey.mockResolvedValue(true);
+  redisService.getIdempotentResult.mockResolvedValue(null);
+  redisService.storeIdempotentResult.mockResolvedValue(undefined);
+  redisService.releaseIdempotencyKey.mockResolvedValue(undefined);
 });
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -271,6 +281,91 @@ describe('FlashSaleService.purchase()', () => {
         expect.objectContaining({ orderId: 'order-uuid', userId, saleId }),
         expect.any(Object),
       );
+    });
+  });
+
+  // ── Idempotency key ─────────────────────────────────────────────────────────
+  describe('Idempotency key', () => {
+    it('does not touch idempotency Redis keys when no key is provided', async () => {
+      await service.purchase(userId, saleId, dto);
+
+      expect(redisService.claimIdempotencyKey).not.toHaveBeenCalled();
+      expect(redisService.storeIdempotentResult).not.toHaveBeenCalled();
+    });
+
+    it('claims a user-scoped key and stores the result on success', async () => {
+      const result = await service.purchase(userId, saleId, dto, 'my-key');
+
+      expect(redisService.claimIdempotencyKey).toHaveBeenCalledWith(
+        `idempotency:${userId}:my-key`,
+        expect.any(Number),
+      );
+      expect(redisService.storeIdempotentResult).toHaveBeenCalledWith(
+        `idempotency:${userId}:my-key`,
+        result,
+        expect.any(Number),
+      );
+    });
+
+    it('returns the cached result without re-running the purchase when a duplicate loses the claim', async () => {
+      redisService.claimIdempotencyKey.mockResolvedValue(false);
+      redisService.getIdempotentResult.mockResolvedValue({ orderId: 'cached-order', jobId: 'cached-job' });
+
+      const result = await service.purchase(userId, saleId, dto, 'my-key');
+
+      expect(result).toEqual({ orderId: 'cached-order', jobId: 'cached-job' });
+      expect(redisService.atomicPurchase).not.toHaveBeenCalled();
+      expect(orderRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('throws 409 when a duplicate loses the claim and the original is still in flight', async () => {
+      redisService.claimIdempotencyKey.mockResolvedValue(false);
+      redisService.getIdempotentResult.mockResolvedValue(null); // still PENDING
+
+      await expect(service.purchase(userId, saleId, dto, 'my-key'))
+        .rejects.toThrow(ConflictException);
+    });
+
+    it('releases the claim when the purchase fails, so the same key can be retried', async () => {
+      redisService.atomicPurchase.mockResolvedValue(-1); // sold out
+
+      await expect(service.purchase(userId, saleId, dto, 'my-key')).rejects.toThrow();
+
+      expect(redisService.releaseIdempotencyKey).toHaveBeenCalledWith(`idempotency:${userId}:my-key`);
+      expect(redisService.storeIdempotentResult).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Sale status endpoint ─────────────────────────────────────────────────────
+  describe('getStatus()', () => {
+    it('returns live stock, sold count, and time remaining from Redis', async () => {
+      redisService.getInventory.mockResolvedValue(37);
+      redisService.getSoldCount.mockResolvedValue(63);
+      redisService.getSaleFromCache.mockResolvedValue(mockSale);
+
+      const result = await service.getStatus(saleId);
+
+      expect(result.saleId).toBe(saleId);
+      expect(result.liveStock).toBe(37);
+      expect(result.liveSold).toBe(63);
+      expect(result.timeRemainingSeconds).toBeGreaterThan(0);
+    });
+
+    it('falls back to DB on cache miss and populates the cache', async () => {
+      redisService.getSaleFromCache.mockResolvedValue(null);
+      saleRepo.findOne.mockResolvedValue(mockSale);
+
+      await service.getStatus(saleId);
+
+      expect(saleRepo.findOne).toHaveBeenCalledTimes(1);
+      expect(redisService.setSaleCache).toHaveBeenCalledWith(saleId, mockSale, 60);
+    });
+
+    it('throws NotFoundException when the sale does not exist anywhere', async () => {
+      redisService.getSaleFromCache.mockResolvedValue(null);
+      saleRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.getStatus(saleId)).rejects.toThrow(NotFoundException);
     });
   });
 });
