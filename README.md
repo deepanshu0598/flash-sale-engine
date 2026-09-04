@@ -205,22 +205,32 @@ Phase 3 — 4 NestJS replicas + nginx
 
 ### Local development (single instance)
 
-**Prerequisites:** Docker, Node.js 20+
+**Prerequisites:** Docker + Docker Compose v2, Node.js 20+, `jq` (only needed for the curl
+examples further down — not required to run the app itself)
 
 ```bash
-# 1. Start infrastructure
+# 0. Clone and enter the repo
+git clone https://github.com/deepanshu0598/flash-sale-engine.git
+cd flash-sale-engine
+
+# 1. Environment config — every value has a working default (see .env.example),
+#    so this step is optional for local dev, but do it anyway: it's where
+#    you'd set a real JWT_SECRET instead of the 'secret' fallback.
+cp .env.example .env
+
+# 2. Start infrastructure
 docker compose up -d postgres redis
 
-# 2. Install dependencies
+# 3. Install dependencies
 npm install
 
-# 3. Run DB migrations
+# 4. Run DB migrations
 npm run migration:run
 
-# 4. Seed 10K users + 50 products + 10 flash sales
+# 5. Seed 10K users + 50 products + 10 flash sales
 npm run seed
 
-# 5. Start the server
+# 6. Start the server
 npm run start:dev
 # App at http://localhost:3000
 ```
