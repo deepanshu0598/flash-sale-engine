@@ -8,7 +8,9 @@ const success = new Counter('successful_purchases'); // 201 — actual purchases
 const errRate = new Rate('error_rate');              // 5xx only
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const TOKEN_POOL_SIZE = 200; // pre-created users; VUs cycle through them
+// Override via env: MAX_VUS=10000 POOL_SIZE=500 (requires Linux + tuned kernel)
+const MAX_VUS         = parseInt(__ENV.MAX_VUS  || '1000', 10);
+const TOKEN_POOL_SIZE = parseInt(__ENV.POOL_SIZE || '200',  10);
 
 // ─── Load profile ─────────────────────────────────────────────────────────────
 export const options = {
@@ -16,9 +18,9 @@ export const options = {
     flash_sale: {
       executor: 'ramping-vus',
       stages: [
-        { duration: '10s', target: 100  }, // warm up
-        { duration: '30s', target: 1000 }, // peak — lock-free, no serialization
-        { duration: '10s', target: 0    }, // ramp down
+        { duration: '10s', target: Math.floor(MAX_VUS * 0.1) }, // warm up
+        { duration: '30s', target: MAX_VUS },                    // ramp to peak
+        { duration: '10s', target: 0       },                    // ramp down
       ],
     },
   },
